@@ -7,7 +7,7 @@ fn main() {
 pub use tokio_etcd_grpc_client::ClientEndpointConfig;
 use tokio_etcd_grpc_client::EtcdGrpcClient;
 
-pub use watcher::Watcher;
+pub use watcher::{Watcher, WatcherKey};
 
 pub struct Client {
     grpc_client: EtcdGrpcClient,
@@ -38,6 +38,6 @@ impl Client {
     }
 
     pub fn watcher(&self) -> Watcher {
-        Watcher::new(self.grpc_client.watch())
+        Watcher::new(self.grpc_client.watch(), self.grpc_client.kv())
     }
 }
