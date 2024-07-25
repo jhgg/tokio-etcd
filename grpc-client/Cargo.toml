@@ -1,0 +1,15 @@
+[package]
+name = "tokio-etcd-grpc-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+http = "1.1.0"
+tower = "0.4.13"
+arc-swap = "1.7.1"
+
+[build-dependencies]
+tonic-build = { version = "0.12", features = ["prost"] }
