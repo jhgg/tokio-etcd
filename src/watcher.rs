@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{hash_map::Entry, HashMap, VecDeque},
     future::{pending, Future},
     panic,
     pin::Pin,
@@ -23,6 +23,7 @@ use tokio_etcd_grpc_client::{
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Response, Status, Streaming};
 
+#[derive(Clone)]
 pub struct Watcher {
     tx: Sender<WorkerMessage>,
 }
@@ -304,6 +305,8 @@ struct WatcherSet {
     // fixme: maybe make VecDeque?
     unsynced_watchers: IndexSet<WatchId>,
     syncing_watchers: IndexSet<WatchId>,
+    pending_cancels: VecDeque<WatchId>,
+    fragmented_responses: HashMap<WatchId, WatchResponse>,
 }
 
 impl WatcherSet {
@@ -314,6 +317,8 @@ impl WatcherSet {
             states: HashMap::new(),
             unsynced_watchers: IndexSet::new(),
             syncing_watchers: IndexSet::new(),
+            fragmented_responses: HashMap::new(),
+            pending_cancels: VecDeque::new(),
         }
     }
 
@@ -362,11 +367,41 @@ impl WatcherSet {
         self.key_to_watch_id.get(key).copied()
     }
 
-    fn remove_watcher(&mut self, watch_id: WatchId) -> Option<WatcherKey> {
-        let WatcherState { key, .. } = self.states.remove(&watch_id)?;
+    /// Cancels a watcher by its watch id,
+    ///
+    /// If `enqueue_pending` is true, the watcher will be enqueued for a cancel request to be sent to the
+    /// etcd server. If false, the watcher will be immediately removed, and no cancel request will be sent. Set
+    /// to false when you receive a cancel response from the server, and true when you receive a cancel request
+    /// from the user.
+    fn cancel_watcher(&mut self, watch_id: WatchId, enqueue_pending: bool) -> Option<WatcherKey> {
+        let WatcherState {
+            key, sync_state, ..
+        } = self.states.remove(&watch_id)?;
         self.key_to_watch_id.remove(&key)?;
-        self.unsynced_watchers.shift_remove(&watch_id);
+
+        match sync_state {
+            WatcherSyncState::Unsynced => {
+                self.unsynced_watchers.shift_remove(&watch_id);
+            }
+            WatcherSyncState::Syncing => {
+                self.syncing_watchers.shift_remove(&watch_id);
+
+                if enqueue_pending {
+                    self.pending_cancels.push_back(watch_id);
+                }
+            }
+            WatcherSyncState::Synced => {
+                if enqueue_pending {
+                    self.pending_cancels.push_back(watch_id);
+                }
+            }
+        }
+
         Some(key)
+    }
+
+    fn take_pending_cancel(&mut self) -> Option<WatchId> {
+        self.pending_cancels.pop_front()
     }
 
     fn update_watcher(
@@ -408,26 +443,68 @@ impl WatcherSet {
         Some(state)
     }
 
-    fn mark_all_unsynced(&mut self) {
+    /// Resets the set for a new connection, which ultimately means:
+    ///
+    /// - Resetting all the sync states to unsynced.
+    /// - Clearing all fragmented responses.
+    /// - Clearing all pending cancels, since we won't re-start the watchers that were cancelled on the new connection.
+    fn reset_for_new_connection(&mut self) {
         for state in self.states.values_mut() {
             state.sync_state = WatcherSyncState::Unsynced;
         }
         self.syncing_watchers.clear();
         self.unsynced_watchers.clear();
         self.unsynced_watchers.extend(self.states.keys());
+        self.fragmented_responses.clear();
+        self.pending_cancels.clear();
     }
 
+    /// Returns the number of watchers that are currently syncing, which means we've sent a create watch request
+    /// to the etcd server, and are waiting for the create response.
     fn num_syncing(&self) -> usize {
         self.syncing_watchers.len()
+    }
+
+    /// Watch responses can be fragmented, so we'll need to merge them together before we can process them.
+    ///
+    /// Returns:
+    ///  - Some(WatchResponse): if the response was a complete response, and we've merged all the fragments.
+    ///  - None: if the response was a fragment, and we're waiting for more fragments.
+    fn try_merge_fragmented_response(&mut self, response: WatchResponse) -> Option<WatchResponse> {
+        let watch_id = WatchId(response.watch_id);
+        match (self.fragmented_responses.entry(watch_id), response.fragment) {
+            // We have an existing fragment, and this is a fragment, so we'll merge them.
+            (Entry::Occupied(mut ent), true) => {
+                ent.get_mut().events.extend(response.events);
+                None
+            }
+            // We have a fragment, but this is a complete response, so we'll remove the fragment and return the
+            // complete response.
+            (Entry::Occupied(ent), false) => {
+                let mut existing = ent.remove();
+                existing.events.extend(response.events);
+                Some(existing)
+            }
+            // We don't have a fragment, and this is a fragment, so we'll just insert it.
+            (Entry::Vacant(ent), true) => {
+                ent.insert(response);
+                None
+            }
+            // We don't have a fragment, and this is a complete response, so we'll just return it.
+            (Entry::Vacant(_), false) => Some(response),
+        }
     }
 }
 
 enum StreamingWatcherMessage {
-    WatchResponse(()),
     Disconnected(DisconnectReason),
 }
 
 impl StreamingWatcher {
+    // When connecting to etcd, we'll only allow a certain number of watchers to sync concurrently, to avoid
+    // overwhelming the server.
+    const CONCURRENT_SYNC_LIMIT: usize = 5;
+
     fn new(watch_client: WatchClient<AuthedChannel>, progress_request_interval: Duration) -> Self {
         Self {
             watch_client,
@@ -436,8 +513,6 @@ impl StreamingWatcher {
             progress_request_interval,
         }
     }
-
-    const CONCURRENT_SYNC_LIMIT: usize = 5;
 
     async fn next_message(&mut self) -> StreamingWatcherMessage {
         loop {
@@ -478,7 +553,6 @@ impl StreamingWatcher {
                     match message {
                         Ok(response) => {
                             self.handle_response(response);
-                            return StreamingWatcherMessage::WatchResponse(());
                         }
                         Err(disconnect_reason) => {
                             // todo: reconnect timeout? backoff?
@@ -494,12 +568,22 @@ impl StreamingWatcher {
     }
 
     fn handle_response(&mut self, response: WatchResponse) {
-        self.set.update_watcher(WatchId(response.watch_id), |s| {
+        let Some(response) = self.set.try_merge_fragmented_response(response) else {
+            return;
+        };
+
+        let watch_id = WatchId(response.watch_id);
+
+        if response.canceled {
+            self.set.cancel_watcher(watch_id, false);
+            return;
+        }
+
+        self.set.update_watcher(watch_id, |s| {
             if response.compact_revision != 0 {
                 s.sync_state = WatcherSyncState::Unsynced;
                 // todo: log compact revision properly, we need to re-fetch the entire key potentially?
                 s.value.revision = response.compact_revision;
-
                 return;
             }
 
@@ -521,6 +605,26 @@ impl StreamingWatcher {
         self.ensure_connected_state();
 
         watch_id
+    }
+
+    fn cancel_watcher(&mut self, watch_id: WatchId) -> Option<WatcherKey> {
+        let key = self.set.cancel_watcher(watch_id, true);
+        self.ensure_connected_state();
+
+        // If we're connected, try and flush any pending cancel requests.
+        if let StreamingWatcherState::Connected(connected) = &mut self.state {
+            while let Some(watch_id) = self.set.take_pending_cancel() {
+                connected.send(WatchRequest {
+                    request_union: Some(watch_request::RequestUnion::CancelRequest(
+                        tokio_etcd_grpc_client::WatchCancelRequest {
+                            watch_id: watch_id.0,
+                        },
+                    )),
+                });
+            }
+        }
+
+        key
     }
 
     fn get_state_by_id(&self, id: &WatchId) -> Option<&WatcherState> {
@@ -546,7 +650,7 @@ impl StreamingWatcher {
     fn do_connect(&mut self) {
         // Since we're connecting, we'll mark all watchers as unsynced, since we're going to re-sync them to
         // the new connection.
-        self.set.mark_all_unsynced();
+        self.set.reset_for_new_connection();
 
         // We'll start by constructing all the initial watch requests.
         let (sender, receiver) = unbounded_channel();
@@ -595,7 +699,6 @@ impl WatcherWorker {
         loop {
             enum Action {
                 WorkerMessage(WorkerMessage),
-                WatchResponse(WatchResponse),
                 StreamDisconnected(DisconnectReason),
                 ReadResult((WatcherKey, Result<Response<RangeResponse>, Status>)),
             }
@@ -616,8 +719,6 @@ impl WatcherWorker {
                 }
                 message = self.streaming_watcher.next_message() => {
                     match message {
-                        // fixme: handle wtch response.
-                        StreamingWatcherMessage::WatchResponse(()) => continue,
                         StreamingWatcherMessage::Disconnected(reason) => Action::StreamDisconnected(reason),
                     }
                 }
@@ -625,9 +726,6 @@ impl WatcherWorker {
 
             match action {
                 Action::WorkerMessage(message) => self.handle_worker_message(message),
-                Action::WatchResponse(response) => {
-                    // todo:
-                }
                 Action::ReadResult((key, value)) => {
                     self.handle_read_result(key, value);
                 }

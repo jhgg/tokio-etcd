@@ -18,3 +18,13 @@ pub mod mvccpb {
 // pub mod v3lockpb {
 //     tonic::include_proto!("v3lockpb");
 // }
+
+impl etcdserverpb::WatchResponse {
+    pub fn is_progress_notify(&self) -> bool {
+        self.events.is_empty()
+            && !self.canceled
+            && !self.created
+            && self.compact_revision == 0
+            && self.header.map_or(0, |h| h.revision) == 0
+    }
+}
