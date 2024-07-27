@@ -1,8 +1,6 @@
-mod watcher;
+use std::sync::OnceLock;
 
-fn main() {
-    println!("Hello, world!");
-}
+mod watcher;
 
 pub use tokio_etcd_grpc_client::ClientEndpointConfig;
 use tokio_etcd_grpc_client::EtcdGrpcClient;
@@ -11,6 +9,7 @@ pub use watcher::{Watcher, WatcherKey};
 
 pub struct Client {
     grpc_client: EtcdGrpcClient,
+    watcher_singleton: OnceLock<Watcher>,
 }
 
 impl Client {
@@ -19,7 +18,10 @@ impl Client {
         endpoint_config: ClientEndpointConfig,
     ) -> Self {
         let grpc_client = tokio_etcd_grpc_client::client(peers, endpoint_config).unwrap();
-        Self { grpc_client }
+        Self {
+            grpc_client,
+            watcher_singleton: OnceLock::new(),
+        }
     }
 
     /// Updates the authentication token used by the client.
@@ -38,6 +40,8 @@ impl Client {
     }
 
     pub fn watcher(&self) -> Watcher {
-        Watcher::new(self.grpc_client.watch(), self.grpc_client.kv())
+        self.watcher_singleton
+            .get_or_init(|| Watcher::new(self.grpc_client.watch(), self.grpc_client.kv()))
+            .clone()
     }
 }

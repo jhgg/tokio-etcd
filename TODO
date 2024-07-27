@@ -1,1 +1,3 @@
-- [ ] addtracing log
+- [x] addtracing log
+- [x] test watcher cancellation by virtue of dropping the receiver.
+- [x] handle watch progress by incrementing progress marker for re-sync on watcher states.

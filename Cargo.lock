@@ -858,11 +858,11 @@ dependencies = [
  "arc-swap",
  "expect-test",
  "http",
- "indexmap 2.2.6",
  "tokio",
  "tokio-etcd-grpc-client",
  "tokio-stream",
  "tonic",
+ "tracing",
 ]
 
 [[package]]

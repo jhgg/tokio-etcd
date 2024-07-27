@@ -30,7 +30,8 @@ fn spawn_watcher_task(i: i32, watcher: &Watcher, key: impl Into<String>) -> Join
 
         println!("{i}: watch state: {wr:?}");
 
-        while let Ok(value) = wr.receiver.recv().await {
+        loop {
+            let value = wr.receiver.recv().await;
             println!("{i}: new value: {value:?}");
         }
     })
