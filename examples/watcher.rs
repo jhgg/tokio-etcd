@@ -1,5 +1,8 @@
 use tokio::task::JoinHandle;
-use tokio_etcd::{Client, ClientEndpointConfig, WatchError, Watched, WatcherKey};
+use tokio_etcd::{
+    watcher::{WatchError, Watched, WatcherKey},
+    Client, ClientEndpointConfig,
+};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {

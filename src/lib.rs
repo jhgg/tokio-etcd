@@ -1,15 +1,13 @@
 use std::sync::{Arc, Mutex, Weak};
 
-mod watcher;
+pub mod watcher;
 
 pub use tokio_etcd_grpc_client::ClientEndpointConfig;
 use tokio_etcd_grpc_client::EtcdGrpcClient;
 
-pub use watcher::{WatchError, Watched, WatcherHandle, WatcherKey};
-
 pub struct Client {
     grpc_client: EtcdGrpcClient,
-    watcher_singleton: WeakSingleton<WatcherHandle>,
+    watcher_singleton: WeakSingleton<watcher::WatcherHandle>,
 }
 
 impl Client {
@@ -47,9 +45,10 @@ impl Client {
     ///
     /// The watcher coalesces watch requests, so that multiple requests watching the same key will only
     /// result in a single watch request being made to etcd.
-    pub fn watcher(&self) -> Arc<WatcherHandle> {
-        self.watcher_singleton
-            .get_or_init(|| WatcherHandle::new(self.grpc_client.watch(), self.grpc_client.kv()))
+    pub fn watcher(&self) -> Arc<watcher::WatcherHandle> {
+        self.watcher_singleton.get_or_init(|| {
+            watcher::WatcherHandle::new(self.grpc_client.watch(), self.grpc_client.kv())
+        })
     }
 }
 
