@@ -17,7 +17,7 @@ use tokio::{
 };
 use tokio_etcd_grpc_client::{
     watch_request, AuthedChannel, Event, EventType, KvClient, RangeRequest, RangeResponse,
-    WatchClient, WatchProgressRequest, WatchRequest, WatchResponse,
+    WatchClient, WatchProgressRequest, WatchRequest, WatchResponse, PROGRESS_WATCH_ID,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Response, Status, Streaming};
@@ -224,7 +224,6 @@ enum DisconnectReason {
 
 impl ConnectedWatcherStream {
     const MAX_PROGRESS_NOTIFICATIONS_WITHOUT_RESPONSE: u8 = 3;
-    const PROGRESS_WATCH_ID: i64 = -1;
 
     fn new(
         stream: Streaming<WatchResponse>,
@@ -275,8 +274,7 @@ impl ConnectedWatcherStream {
 
             match message {
                 Ok(Some(response)) => {
-                    // todo: update revision for watcher state based on header.revision.
-                    if response.watch_id == Self::PROGRESS_WATCH_ID {
+                    if response.watch_id == PROGRESS_WATCH_ID {
                         self.progress_notifications_requested_without_response = 0;
                     }
 
@@ -285,7 +283,7 @@ impl ConnectedWatcherStream {
                 Ok(None) => {
                     return Err(DisconnectReason::StreamEnded);
                 }
-                Err(e) => {
+                Err(_e) => {
                     // todo: log this error?
                     continue;
                 }
@@ -341,7 +339,7 @@ impl WatcherKey {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WatcherSyncState {
     Unsynced,
     Syncing,
@@ -361,6 +359,34 @@ struct WatcherState {
     /// (as it may have been compacted).
     revision: i64,
     sender: broadcast::Sender<WatcherValue>,
+}
+
+// A subset of the WatcherState, which contains mutable references to fields that are safe to update.
+struct UpdatableWatcherState<'a> {
+    sync_state: &'a mut WatcherSyncState,
+    value: &'a mut WatcherValue,
+    revision: &'a mut i64,
+    sender: &'a broadcast::Sender<WatcherValue>,
+}
+
+impl UpdatableWatcherState<'_> {
+    fn process_event(&mut self, event: Event) {
+        let kv = event.kv.as_ref().expect("invariant: kv is always present");
+        let value = match event.r#type() {
+            EventType::Put => WatcherValue::Set {
+                value: kv.value.clone().into(),
+                mod_revision: kv.mod_revision,
+                create_revision: kv.create_revision,
+            },
+            EventType::Delete => WatcherValue::Unset {
+                mod_revision: Some(kv.mod_revision),
+            },
+        };
+
+        *self.value = value.clone();
+        *self.revision = kv.mod_revision.max(*self.revision);
+        self.sender.send(value).ok();
+    }
 }
 
 impl WatcherState {
@@ -383,24 +409,6 @@ impl WatcherState {
                 },
             )),
         }
-    }
-
-    fn update_from_event(&mut self, event: Event) {
-        let kv = event.kv.as_ref().expect("invariant: kv is always present");
-        let value = match event.r#type() {
-            EventType::Put => WatcherValue::Set {
-                value: kv.value.clone().into(),
-                mod_revision: kv.mod_revision,
-                create_revision: kv.create_revision,
-            },
-            EventType::Delete => WatcherValue::Unset {
-                mod_revision: Some(kv.mod_revision),
-            },
-        };
-
-        self.value = value.clone();
-        self.revision = kv.mod_revision.max(self.revision);
-        self.sender.send(value).ok();
     }
 }
 
@@ -487,7 +495,7 @@ impl WatcherSet {
                 let state = self
                     .update_watcher(*unsynced_id, |state| {
                         assert!(matches!(state.sync_state, WatcherSyncState::Unsynced));
-                        state.sync_state = WatcherSyncState::Syncing;
+                        *state.sync_state = WatcherSyncState::Syncing;
                     })
                     .expect("invariant: found unsynced watcher, but watcher not found");
                 return Some(state.initial_watch_request());
@@ -521,16 +529,15 @@ impl WatcherSet {
             }
             WatcherSyncState::Syncing => {
                 self.syncing_watchers.retain(|id| *id != watch_id);
+            }
+            WatcherSyncState::Synced => {}
+        }
 
-                if enqueue_pending {
-                    self.pending_cancels.push_back(watch_id);
-                }
-            }
-            WatcherSyncState::Synced => {
-                if enqueue_pending {
-                    self.pending_cancels.push_back(watch_id);
-                }
-            }
+        // If we're not in the unsynced state, it means that we've already sent a watch request
+        // to the etcd server, and we should send a cancel request. Otherwise, we can just remove
+        // the watcher from the set, as the server never knew about it.
+        if sync_state != WatcherSyncState::Unsynced && enqueue_pending {
+            self.pending_cancels.push_back(watch_id);
         }
 
         Some(key)
@@ -539,37 +546,39 @@ impl WatcherSet {
     fn update_watcher(
         &mut self,
         watch_id: WatchId,
-        f: impl FnOnce(&mut WatcherState),
+        f: impl FnOnce(UpdatableWatcherState),
     ) -> Option<&WatcherState> {
         let state = self.states.get_mut(&watch_id)?;
         let prev_sync_state = state.sync_state;
-        f(state);
+        let updatable_state = UpdatableWatcherState {
+            sync_state: &mut state.sync_state,
+            value: &mut state.value,
+            revision: &mut state.revision,
+            sender: &state.sender,
+        };
+        f(updatable_state);
 
         use WatcherSyncState::*;
-        match (&prev_sync_state, &state.sync_state) {
-            (Unsynced, Synced) => {
-                vec_deq_fast_remove(&mut self.unsynced_watchers, &watch_id);
-            }
-            (Synced, Unsynced) => {
-                self.unsynced_watchers.push_back(watch_id);
-            }
-            (Syncing, Synced) => {
-                vec_deq_fast_remove(&mut self.syncing_watchers, &watch_id);
-            }
-            (Synced, Syncing) => {
-                self.syncing_watchers.push_back(watch_id);
-            }
-            (Unsynced, Syncing) => {
-                vec_deq_fast_remove(&mut self.unsynced_watchers, &watch_id);
-                self.syncing_watchers.push_back(watch_id);
-            }
-            (Syncing, Unsynced) => {
-                vec_deq_fast_remove(&mut self.syncing_watchers, &watch_id);
-                self.unsynced_watchers.push_back(watch_id);
-            }
-            (Unsynced, Unsynced) | (Syncing, Syncing) | (Synced, Synced) => {
-                // no-op, no state change.
-            }
+        if prev_sync_state != state.sync_state {
+            let mut container_for_state =
+                |s: &WatcherSyncState, f: fn(&mut VecDeque<WatchId>, &WatchId)| match s {
+                    Unsynced => f(&mut self.unsynced_watchers, &watch_id),
+                    Syncing => f(&mut self.syncing_watchers, &watch_id),
+                    Synced => {}
+                };
+
+            container_for_state(&prev_sync_state, |target, id| {
+                // Check if the watcher is at the front of the vecdeq, and if so, we can just pop it.
+                // Generally, this should be the case, as we'll be processing watchers in order.
+                if target.front() == Some(id) {
+                    target.pop_front();
+                    return;
+                }
+
+                // Otherwise, we'll need to find the item in the vecdeq, and remove it.
+                target.retain(|i| i != id);
+            });
+            container_for_state(&state.sync_state, |target, id| target.push_back(*id));
         }
 
         Some(state)
@@ -621,17 +630,10 @@ impl WatcherSet {
             (Entry::Vacant(_), false) => Some(response),
         }
     }
-}
 
-fn vec_deq_fast_remove<T: Eq>(vec_deq: &mut VecDeque<T>, item: &T) {
-    // First, we'll check to see if the item is at the head of the vecdeq, and we can just pop it in a single operation:
-    if vec_deq.front() == Some(item) {
-        vec_deq.pop_front();
-        return;
+    fn has_watcher(&self, watch_id: WatchId) -> bool {
+        self.states.contains_key(&watch_id)
     }
-
-    // Otherwise, we'll need to find the item in the vecdeq, and remove it.
-    vec_deq.retain(|i| i != item);
 }
 
 impl StreamingWatcher {
@@ -678,7 +680,7 @@ impl StreamingWatcher {
                         }
                         (Err(error), _) => {
                             // todo: backoff.
-                            let reconnect_delay = std::time::Duration::from_secs(5);
+                            let reconnect_delay = Duration::from_secs(5);
                             self.state = StreamingWatcherState::Reconnecting(Box::pin(
                                 tokio::time::sleep(reconnect_delay),
                             ));
@@ -702,7 +704,7 @@ impl StreamingWatcher {
                         }
                         Err(disconnect_reason) => {
                             // todo: reconnect timeout? backoff?
-                            let reconnect_delay = std::time::Duration::from_secs(5);
+                            let reconnect_delay = Duration::from_secs(5);
                             self.state = StreamingWatcherState::Reconnecting(Box::pin(
                                 tokio::time::sleep(reconnect_delay),
                             ));
@@ -723,9 +725,7 @@ impl StreamingWatcher {
         // When receiving a progress notification, we can update the revision for all watchers, so that
         // when we re-sync them, we'll start from a more recent revision, rather than an older one,
         // which might be compacted.
-        if response.is_progress_notify()
-            && response.watch_id == ConnectedWatcherStream::PROGRESS_WATCH_ID
-        {
+        if response.is_progress_notify() && response.watch_id == PROGRESS_WATCH_ID {
             let revision = response
                 .header
                 .expect("invariant: header is always present")
@@ -742,7 +742,7 @@ impl StreamingWatcher {
 
         // There is a chance that we may receive a watch response for a watcher we already don't care about.
         // In this case, we'll just ignore the response, since we've already cancelled the watcher.
-        if !self.set.states.contains_key(&watch_id) {
+        if !self.set.has_watcher(watch_id) {
             tracing::info!(
                 "received response for unknown watcher: {:?} - ignoring",
                 response.watch_id
@@ -758,31 +758,31 @@ impl StreamingWatcher {
         if response.canceled {
             self.set.cancel_watcher(watch_id, false);
         } else {
-            self.set.update_watcher(watch_id, |s| {
+            self.set.update_watcher(watch_id, |mut s| {
                 if response.compact_revision != 0 {
                     tracing::warn!(
                         "when trying to sync watcher {:?} at revision {}, etcd server returned a compact revision of {}, restarting watcher at compact revision.",
                         watch_id, s.revision, response.compact_revision
                     );
-                    s.sync_state = WatcherSyncState::Unsynced;
+                    *s.sync_state = WatcherSyncState::Unsynced;
                     // fixme: log compact revision properly, we need to re-fetch the entire key potentially?
-                    s.revision = response.compact_revision;
+                    *s.revision = response.compact_revision;
                     return;
                 }
 
                 // the server has acknowledged the watcher, so we can mark it as synced.
                 if response.created {
                     tracing::info!("watcher {:?} synced (incarnation: {}", watch_id, self.connection_incarnation);
-                    s.sync_state = WatcherSyncState::Synced;
+                    *s.sync_state = WatcherSyncState::Synced;
                 } else {
-                    s.revision = response
+                    *s.revision = response
                         .header
                         .expect("invariant: header is always present")
                         .revision;
                 }
 
                 for event in response.events {
-                    s.update_from_event(event);
+                    s.process_event(event);
                 }
             });
         }
@@ -952,6 +952,10 @@ impl WatcherWorker {
             return;
         };
 
+        let Some(tx) = self.weak_tx.upgrade() else {
+            return;
+        };
+
         match value {
             Ok(response) => {
                 let response = response.into_inner();
@@ -978,9 +982,6 @@ impl WatcherWorker {
                         .expect("invariant: the watcher should be new");
 
                     // fixme: should we log when the sender is closed? or just ignore it?
-                    let Some(tx) = self.weak_tx.upgrade() else {
-                        return;
-                    };
 
                     for sender in senders {
                         if sender.is_closed() {
@@ -1032,10 +1033,9 @@ impl WatcherWorker {
         // Check to see if we're already watching that key, so we can duplicate the watcher:
         if let Some(state) = self.streaming_watcher.get_state_by_key(&key) {
             // We indeed have the key? Let's just send the initial state to the resolver.
-            let value = state.value.clone();
             sender
                 .send(Ok(Watched {
-                    value,
+                    value: state.value.clone(),
                     receiver: WatcherReceiver::new(state.sender.subscribe(), tx, state.id),
                 }))
                 .ok();

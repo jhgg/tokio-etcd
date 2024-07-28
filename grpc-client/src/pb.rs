@@ -4,6 +4,9 @@ pub mod authpb {
 
 pub mod etcdserverpb {
     tonic::include_proto!("etcdserverpb");
+
+    // This is the watch id that is returned when a progress request is made.
+    pub const PROGRESS_WATCH_ID: i64 = -1;
 }
 
 pub mod mvccpb {
