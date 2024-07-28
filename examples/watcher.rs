@@ -1,38 +1,50 @@
 use tokio::task::JoinHandle;
-use tokio_etcd::{Client, ClientEndpointConfig, Watcher, WatcherKey};
+use tokio_etcd::{Client, ClientEndpointConfig, WatchError, Watched, WatcherKey};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let client = Client::new(
         // fixme: no need for into_iter but yet here we are. :(
-        // fixme: should we let user specify port?
         vec!["localhost"].into_iter(),
         ClientEndpointConfig::http(),
     );
-    let watcher = client.watcher();
     let jhs = vec![
-        spawn_watcher_task(1, &watcher, "hello"),
-        spawn_watcher_task(2, &watcher, "world"),
-        spawn_watcher_task(3, &watcher, "world"),
+        spawn_watcher_task(1, &client, "hello"),
+        spawn_watcher_task(2, &client, "world"),
+        spawn_watcher_task(3, &client, "world"),
     ];
 
     for jh in jhs {
-        jh.await.unwrap();
+        let _ = jh.await.unwrap();
     }
 }
 
-fn spawn_watcher_task(i: i32, watcher: &Watcher, key: impl Into<String>) -> JoinHandle<()> {
-    let watcher = watcher.clone();
+fn spawn_watcher_task(
+    i: i32,
+    client: &Client,
+    key: impl Into<String>,
+) -> JoinHandle<Result<(), WatchError>> {
+    let watcher = client.watcher();
     let key = WatcherKey::key_str(key);
 
     tokio::task::spawn(async move {
-        let mut wr = watcher.watch(key).await.unwrap();
+        let Watched {
+            value,
+            mut receiver,
+        } = watcher.watch(key).await?;
 
-        println!("{i}: watch state: {wr:?}");
+        println!("{i}: watch state: {value:?}");
 
         loop {
-            let value = wr.receiver.recv().await;
-            println!("{i}: new value: {value:?}");
+            match receiver.recv().await {
+                Ok(value) => {
+                    println!("{i}: new value: {value:?}");
+                }
+                Err(cancelled) => {
+                    println!("{i}: watch cancelled: {cancelled:?}");
+                    return Ok(());
+                }
+            }
         }
     })
 }
