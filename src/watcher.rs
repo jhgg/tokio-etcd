@@ -90,7 +90,7 @@ pub enum WatcherValue {
 
 #[derive(Debug, Error, Clone)]
 #[error("watch cancelled: {reason}")]
-pub struct WatchCancelled {
+pub struct WatchCancelledByServer {
     reason: Arc<str>,
 }
 
@@ -134,12 +134,12 @@ impl Drop for WatchReceiverDropGuard {
 
 enum ReceiverState {
     Active {
-        receiver: broadcast::Receiver<Result<WatcherValue, WatchCancelled>>,
+        receiver: broadcast::Receiver<Result<WatcherValue, WatchCancelledByServer>>,
         // this field must be the last field in the struct, as it must
         // be dropped after the receiver.
         drop_guard: WatchReceiverDropGuard,
     },
-    Cancelled(WatchCancelled),
+    Cancelled(WatchCancelledByServer),
 }
 
 pub struct WatcherReceiver {
@@ -155,7 +155,7 @@ impl std::fmt::Debug for WatcherReceiver {
 
 impl WatcherReceiver {
     fn new(
-        receiver: broadcast::Receiver<Result<WatcherValue, WatchCancelled>>,
+        receiver: broadcast::Receiver<Result<WatcherValue, WatchCancelledByServer>>,
         tx: UnboundedSender<WorkerMessage>,
         watch_id: WatchId,
     ) -> Self {
@@ -167,7 +167,7 @@ impl WatcherReceiver {
         }
     }
 
-    pub async fn recv(&mut self) -> Result<WatcherValue, WatchCancelled> {
+    pub async fn recv(&mut self) -> Result<WatcherValue, WatchCancelledByServer> {
         loop {
             match &mut self.receiver {
                 ReceiverState::Active {
@@ -183,7 +183,7 @@ impl WatcherReceiver {
                         // If we have lagged, we'll skip over it and try to receive the next value.
                         Err(RecvError::Lagged(_)) => continue,
                         Err(RecvError::Closed) => {
-                            self.receiver = ReceiverState::Cancelled(WatchCancelled {
+                            self.receiver = ReceiverState::Cancelled(WatchCancelledByServer {
                                 reason: "watcher receiver closed".into(),
                             });
                         }
@@ -428,7 +428,7 @@ struct WatcherState {
     /// that we know about, and not the revision of the value itself, which may be older, and unable to be watched
     /// (as it may have been compacted).
     revision: i64,
-    sender: broadcast::Sender<Result<WatcherValue, WatchCancelled>>,
+    sender: broadcast::Sender<Result<WatcherValue, WatchCancelledByServer>>,
 }
 
 // A subset of the WatcherState, which contains mutable references to fields that are safe to update.
@@ -436,7 +436,7 @@ struct UpdatableWatcherState<'a> {
     sync_state: &'a mut WatcherSyncState,
     value: &'a mut WatcherValue,
     revision: &'a mut i64,
-    sender: &'a broadcast::Sender<Result<WatcherValue, WatchCancelled>>,
+    sender: &'a broadcast::Sender<Result<WatcherValue, WatchCancelledByServer>>,
 }
 
 impl UpdatableWatcherState<'_> {
@@ -484,6 +484,7 @@ impl WatcherState {
 
 struct WatcherMap {
     next_watch_id: WatchId,
+    // fixme: move this out of watcher map and into the worker.
     key_to_watch_id: HashMap<WatcherKey, WatchId>,
     states: HashMap<WatchId, WatcherState, WatchIdHasher>,
     unsynced_watchers: VecDeque<WatchId>,
@@ -758,7 +759,7 @@ impl WatcherMap {
         if response.canceled {
             self.cancel_watcher(
                 watch_id,
-                CancelSource::Server(WatchCancelled {
+                CancelSource::Server(WatchCancelledByServer {
                     reason: response.cancel_reason.into(),
                 }),
             );
@@ -803,7 +804,7 @@ enum CancelSource {
     /// The server cancelled the watcher.
     ///
     /// This will result in a cancellation message being sent to the watcher's receiver.
-    Server(WatchCancelled),
+    Server(WatchCancelledByServer),
 }
 
 impl ReconnectingWatchClient {
@@ -921,6 +922,17 @@ impl ReconnectingWatchClient {
         self.sync_connection();
 
         Some(key)
+    }
+
+    /// Cancels a watcher if there are no receivers for the watcher. Returns Some(WatcherKey) if the watcher was
+    /// cancelled, and None if the watcher was not cancelled.
+    fn cancel_watcher_if_no_receivers(&mut self, watch_id: WatchId) -> Option<WatcherKey> {
+        let state = self.watchers.states.get(&watch_id)?;
+        if state.sender.receiver_count() == 0 {
+            self.cancel_watcher(watch_id)
+        } else {
+            None
+        }
     }
 
     fn get_state_by_key(&self, key: &WatcherKey) -> Option<&WatcherState> {
@@ -1054,7 +1066,8 @@ impl WatcherWorker {
                 self.do_watch_key(key, sender);
             }
             WorkerMessage::ReceiverDropped(watch_id) => {
-                self.maybe_cancel_watcher(watch_id);
+                self.streaming_watcher
+                    .cancel_watcher_if_no_receivers(watch_id);
             }
         }
     }
@@ -1097,8 +1110,6 @@ impl WatcherWorker {
                         .add_watcher(key.clone(), value, revision)
                         .expect("invariant: the watcher should be new");
 
-                    // fixme: should we log when the sender is closed? or just ignore it?
-
                     for sender in senders {
                         if sender.is_closed() {
                             continue;
@@ -1120,7 +1131,8 @@ impl WatcherWorker {
                 };
 
                 // If somehow all senders were dropped, we can detect that here and cancel the watcher.
-                self.maybe_cancel_watcher(watch_id);
+                self.streaming_watcher
+                    .cancel_watcher_if_no_receivers(watch_id);
             }
             Err(status) => {
                 for sender in senders {
@@ -1173,20 +1185,6 @@ impl WatcherWorker {
                     (key, result)
                 });
             }
-        }
-    }
-
-    /// Checks a watcher to see if all receivers have been dropped, and if so, cancels the watcher.
-    fn maybe_cancel_watcher(&mut self, watch_id: WatchId) {
-        let all_receivers_dropped = self
-            .streaming_watcher
-            .watchers
-            .states
-            .get(&watch_id)
-            .map_or(true, |state| state.sender.receiver_count() == 0);
-
-        if all_receivers_dropped {
-            self.streaming_watcher.cancel_watcher(watch_id);
         }
     }
 }
