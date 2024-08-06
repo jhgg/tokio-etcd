@@ -1,9 +1,11 @@
 use std::sync::{Arc, Mutex, Weak};
 
 pub mod watcher;
+mod ids;
 
 pub use tokio_etcd_grpc_client::ClientEndpointConfig;
 use tokio_etcd_grpc_client::EtcdGrpcClient;
+pub use ids::{LeaseId, WatchId};
 
 pub struct Client {
     grpc_client: EtcdGrpcClient,
