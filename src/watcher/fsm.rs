@@ -8,7 +8,7 @@ use tokio_etcd_grpc_client::{
     watch_request, Event, EventType, KeyValue, WatchRequest, WatchResponse, PROGRESS_WATCH_ID,
 };
 
-use super::{WatchIdHasher, WatcherKey};
+use super::Key;
 use crate::{ids::IdFastHasherBuilder, LeaseId, WatchId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,7 +24,7 @@ enum WatcherSyncState {
 
 struct WatcherState {
     id: WatchId,
-    key: WatcherKey,
+    key: Key,
     sync_state: WatcherSyncState,
     /// The revision which we last received from the etcd server either by virtue of getting a watch response,
     /// or by a progress notification.
@@ -41,11 +41,11 @@ struct UpdatableWatcherState<'a> {
     revision: &'a mut i64,
 }
 
-struct WatcherEvent {
+pub(crate) struct WatcherEvent {
     /// The key (in bytes) that has been updated.
     key: Arc<[u8]>,
     /// The value that the key has been updated to.
-    value: WatcherValue,
+    pub(crate) value: WatcherValue,
 }
 
 #[derive(Clone, Debug)]
@@ -110,15 +110,11 @@ impl UpdatableWatcherState<'_> {
 
 impl WatcherState {
     fn initial_watch_request(&self) -> WatchRequest {
-        let (key, range_end) = match &self.key {
-            WatcherKey::Key(key) => (key.clone(), vec![]),
-            // WatcherKey::Prefix(prefix) => (prefix.clone(), vec![]),
-        };
         WatchRequest {
             request_union: Some(watch_request::RequestUnion::CreateRequest(
                 tokio_etcd_grpc_client::WatchCreateRequest {
-                    key,
-                    range_end,
+                    key: self.key.0.clone().into_vec(),
+                    range_end: vec![],
                     start_revision: self.revision + 1,
                     progress_notify: false,
                     filters: vec![],
@@ -168,7 +164,7 @@ impl WatcherFsm {
     ///
     /// The watcher starts out as unsynced, and will progress towards sync as the connecion managing this
     /// set progresses.
-    pub(crate) fn add_watcher(&mut self, key: WatcherKey, revision: i64) -> WatchId {
+    pub(crate) fn add_watcher(&mut self, key: Key, revision: i64) -> WatchId {
         let watch_id = self.next_watch_id;
         self.next_watch_id = watch_id.next();
         self.states.insert(
@@ -213,7 +209,7 @@ impl WatcherFsm {
         &mut self,
         watch_id: WatchId,
         cancel_source: &CancelSource,
-    ) -> Option<WatcherKey> {
+    ) -> Option<Key> {
         let WatcherState {
             key, sync_state, ..
         } = self.states.remove(&watch_id)?;
@@ -239,8 +235,7 @@ impl WatcherFsm {
                     self.pending_cancels.push_back(watch_id);
                 }
             }
-            // fixme: do something here?
-            CancelSource::Server(_) => {}
+            CancelSource::Server => {}
         }
 
         Some(key)
@@ -386,13 +381,14 @@ impl WatcherFsm {
         };
 
         if response.canceled {
-            let cancel_source = CancelSource::Server(WatchCancelledByServer {
-                reason: response.cancel_reason.into(),
-            });
+            self.cancel_watcher(watch_id, &CancelSource::Server);
 
-            self.cancel_watcher(watch_id, &cancel_source);
-
-            Some((watch_id, TransformedWatchResponse::Cancelled(cancel_source)))
+            Some((
+                watch_id,
+                TransformedWatchResponse::Cancelled(WatchCancelledByServer {
+                    reason: response.cancel_reason.into(),
+                }),
+            ))
         } else {
             let events = self.update_watcher(watch_id, |mut s| {
                 if response.compact_revision != 0 {
@@ -433,17 +429,13 @@ impl WatcherFsm {
 
 pub enum CancelSource {
     /// The client requested the watcher to be cancelled.
-    ///
-    /// This will result in a cancel request being sent to the server, if the watcher isn't unsynced.
     Client,
     /// The server cancelled the watcher.
-    ///
-    /// This will result in a cancellation message being sent to the watcher's receiver.
-    Server(WatchCancelledByServer),
+    Server,
 }
 
 pub enum TransformedWatchResponse {
-    Cancelled(CancelSource),
+    Cancelled(WatchCancelledByServer),
     Events(Vec<WatcherEvent>),
 }
 

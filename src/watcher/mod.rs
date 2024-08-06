@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use fsm::{WatchCancelledByServer, WatcherValue};
+use fsm::{TransformedWatchResponse, WatchCancelledByServer, WatcherValue};
 use fsm_client::WatcherFsmClient;
 use thiserror::Error;
 use tokio::{
@@ -22,7 +22,7 @@ use tokio::{
 use tokio_etcd_grpc_client::{AuthedChannel, KvClient, RangeRequest, RangeResponse, WatchClient};
 use tonic::{Response, Status};
 
-use crate::WatchId;
+use crate::{ids::IdFastHasherBuilder, WatchId};
 
 /// A high-level etcd watcher, which handles the complexity of watching keys in etcd.
 ///
@@ -54,10 +54,13 @@ impl WatcherHandle {
 
     /// Watches a key in etcd, returning the latest value of the key, and a receiver that can be used to receive
     /// updates to the key.
-    pub async fn watch(&self, key: WatcherKey) -> Result<Watched, WatchError> {
+    pub async fn watch_key(&self, key: impl Into<Key>) -> Result<Watched, WatchError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(WorkerMessage::WatchKey { key, sender: tx })
+            .send(WorkerMessage::WatchKey {
+                key: key.into(),
+                sender: tx,
+            })
             .ok();
 
         // fixme: ???
@@ -67,7 +70,7 @@ impl WatcherHandle {
 
 enum WorkerMessage {
     WatchKey {
-        key: WatcherKey,
+        key: Key,
         sender: InitialWatchSender,
     },
     ReceiverDropped(WatchId),
@@ -185,37 +188,159 @@ type InitialWatchSender = tokio::sync::oneshot::Sender<Result<Watched, WatchErro
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum WatcherKey {
-    Key(Vec<u8>),
-    // fixme: we should have a better way to represent a watcher.
-    // Prefix(String),
+pub struct Key(Box<[u8]>);
+
+impl From<String> for Key {
+    fn from(value: String) -> Self {
+        Self::new(value.into_bytes())
+    }
 }
 
-impl WatcherKey {
-    pub fn key_str(key: impl Into<String>) -> Self {
-        WatcherKey::Key(key.into().into_bytes())
+impl From<Vec<u8>> for Key {
+    fn from(value: Vec<u8>) -> Self {
+        Self::new(value)
     }
+}
 
+impl From<Box<[u8]>> for Key {
+    fn from(value: Box<[u8]>) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for Key {
+    fn from(value: &str) -> Self {
+        Self::new(value.as_bytes().to_owned())
+    }
+}
+
+impl Key {
     fn make_range_request(&self) -> RangeRequest {
-        let key = match self {
-            WatcherKey::Key(key) => key.clone(),
-            // WatcherKey::Prefix(prefix) => prefix.clone().into_bytes(),
-        };
-
         RangeRequest {
-            key,
+            key: self.0.clone().into_vec(),
             ..Default::default()
         }
+    }
+
+    fn new(key: impl Into<Box<[u8]>>) -> Self {
+        Self(key.into())
+    }
+}
+
+struct KeyWatchState {
+    key: Key,
+    id: WatchId,
+    sender: broadcast::Sender<Result<WatcherValue, WatchCancelledByServer>>,
+    value: WatcherValue,
+}
+
+#[derive(Default)]
+struct KeySet {
+    watched_keys: HashMap<WatchId, KeyWatchState, IdFastHasherBuilder>,
+    key_to_watch_id: HashMap<Key, WatchId>,
+}
+
+#[derive(Error, Debug)]
+enum InsertError {
+    #[error("key already exists (existing watch id: {existing_watch_id:?}")]
+    KeyAlreadyExists { existing_watch_id: WatchId },
+    #[error("watch id already exists (existing key: {existing_key:?}")]
+    WatchIdAlreadyExists { existing_key: Key },
+}
+
+impl KeySet {
+    fn get_watch_state_by_key(&self, key: &Key) -> Option<&KeyWatchState> {
+        let watch_id = self.key_to_watch_id.get(key)?;
+        Some(&self.watched_keys[watch_id])
+    }
+
+    fn get_watch_state_by_id(&self, id: &WatchId) -> Option<&KeyWatchState> {
+        self.watched_keys.get(id)
+    }
+
+    fn update_from_watch_response(&mut self, id: WatchId, response: TransformedWatchResponse) {
+        let Some(state) = self.watched_keys.get_mut(&id) else {
+            return;
+        };
+
+        match response {
+            TransformedWatchResponse::Cancelled(reason) => {
+                state.sender.send(Err(reason)).ok();
+                self.remove(id);
+            }
+            TransformedWatchResponse::Events(events) => {
+                for event in events {
+                    state.value = event.value;
+                    state.sender.send(Ok(state.value.clone())).ok();
+                }
+            }
+        }
+    }
+
+    fn insert(
+        &mut self,
+        key: Key,
+        id: WatchId,
+        broadcast_channel_capacity: usize,
+        value: WatcherValue,
+    ) -> Result<&KeyWatchState, InsertError> {
+        let vacant_key = match self.key_to_watch_id.entry(key) {
+            Entry::Occupied(ent) => {
+                return Err(InsertError::KeyAlreadyExists {
+                    existing_watch_id: *ent.get(),
+                })
+            }
+            Entry::Vacant(ent) => ent,
+        };
+
+        let vacant_watch_id = match self.watched_keys.entry(id) {
+            Entry::Occupied(ent) => {
+                return Err(InsertError::WatchIdAlreadyExists {
+                    existing_key: ent.get().key.clone(),
+                })
+            }
+            Entry::Vacant(ent) => ent,
+        };
+
+        let key = vacant_key.key().clone();
+        vacant_key.insert(id);
+        Ok(vacant_watch_id.insert(KeyWatchState {
+            key,
+            id,
+            value,
+            sender: broadcast::channel(broadcast_channel_capacity).0,
+        }))
+    }
+
+    fn remove(&mut self, watch_id: WatchId) -> Option<KeyWatchState> {
+        let state = self.watched_keys.remove(&watch_id)?;
+        self.key_to_watch_id
+            .remove(&state.key)
+            .expect("invariant: key must exist in key_to_watch_id");
+
+        Some(state)
+    }
+
+    fn cancel_watcher_if_no_receivers(&mut self, watch_id: WatchId) -> bool {
+        if let Some(state) = self.watched_keys.get(&watch_id) {
+            if state.sender.receiver_count() == 0 {
+                self.remove(watch_id);
+                return true;
+            }
+        }
+
+        false
     }
 }
 
 struct WatcherWorker {
     rx: UnboundedReceiver<WorkerMessage>,
     weak_tx: WeakUnboundedSender<WorkerMessage>,
-    in_progress_reads: HashMap<WatcherKey, Vec<InitialWatchSender>>,
+    in_progress_reads: HashMap<Key, Vec<InitialWatchSender>>,
     streaming_watcher: WatcherFsmClient,
+    watched_keys: KeySet,
     kv_client: KvClient<AuthedChannel>,
-    range_request_join_set: JoinSet<(WatcherKey, Result<Response<RangeResponse>, Status>)>,
+    range_request_join_set: JoinSet<(Key, Result<Response<RangeResponse>, Status>)>,
 }
 
 impl WatcherWorker {
@@ -230,6 +355,7 @@ impl WatcherWorker {
             weak_tx,
             kv_client,
             in_progress_reads: Default::default(),
+            watched_keys: Default::default(),
             streaming_watcher: WatcherFsmClient::new(watch_client, Duration::from_secs(60)),
             range_request_join_set: JoinSet::new(),
         }
@@ -239,7 +365,8 @@ impl WatcherWorker {
         loop {
             enum Action {
                 WorkerMessage(WorkerMessage),
-                ReadResult((WatcherKey, Result<Response<RangeResponse>, Status>)),
+                ReadResult(Key, Result<Response<RangeResponse>, Status>),
+                WatchResponse(WatchId, TransformedWatchResponse),
             }
 
             let action = tokio::select! {
@@ -255,16 +382,19 @@ impl WatcherWorker {
                 },
                 Some(read_request_result) = self.range_request_join_set.join_next(), if !self.range_request_join_set.is_empty() => {
                     match read_request_result {
-                        Ok(response) => Action::ReadResult(response),
+                        Ok((key, result)) => Action::ReadResult(key, result),
                         Err(panic) => panic::resume_unwind(panic.into_panic()),
                     }
                 }
-                _ = self.streaming_watcher.next() => { continue; }
+                (watch_id, response) = self.streaming_watcher.next() => Action::WatchResponse(watch_id, response),
             };
 
             match action {
                 Action::WorkerMessage(message) => self.handle_worker_message(message),
-                Action::ReadResult((key, value)) => {
+                Action::WatchResponse(watch_id, response) => {
+                    self.handle_watch_response(watch_id, response);
+                }
+                Action::ReadResult(key, value) => {
                     self.handle_read_result(key, value);
                 }
             }
@@ -277,17 +407,18 @@ impl WatcherWorker {
                 self.do_watch_key(key, sender);
             }
             WorkerMessage::ReceiverDropped(watch_id) => {
-                self.streaming_watcher
-                    .cancel_watcher_if_no_receivers(watch_id);
+                self.cancel_watcher_if_no_receivers(watch_id);
             }
         }
     }
 
-    fn handle_read_result(
-        &mut self,
-        key: WatcherKey,
-        value: Result<Response<RangeResponse>, Status>,
-    ) {
+    fn cancel_watcher_if_no_receivers(&mut self, watch_id: WatchId) {
+        if self.watched_keys.cancel_watcher_if_no_receivers(watch_id) {
+            self.streaming_watcher.cancel_watcher(watch_id);
+        }
+    }
+
+    fn handle_read_result(&mut self, key: Key, value: Result<Response<RangeResponse>, Status>) {
         let Some(senders) = self.in_progress_reads.remove(&key) else {
             return;
         };
@@ -312,10 +443,16 @@ impl WatcherWorker {
 
                 // Now, begin watching:
                 let watch_id = {
+                    let watch_id = self.streaming_watcher.add_watcher(key.clone(), revision);
                     let state = self
-                        .streaming_watcher
-                        .add_watcher(key.clone(), value, revision)
-                        .expect("invariant: the watcher should be new");
+                        .watched_keys
+                        .insert(
+                            key.clone(),
+                            watch_id,
+                            16, // fixme, dont hardcode
+                            value,
+                        )
+                        .expect("should not fail");
 
                     for sender in senders {
                         if sender.is_closed() {
@@ -334,12 +471,11 @@ impl WatcherWorker {
                             .ok();
                     }
 
-                    state.id
+                    watch_id
                 };
 
                 // If somehow all senders were dropped, we can detect that here and cancel the watcher.
-                self.streaming_watcher
-                    .cancel_watcher_if_no_receivers(watch_id);
+                self.cancel_watcher_if_no_receivers(watch_id);
             }
             Err(status) => {
                 for sender in senders {
@@ -353,7 +489,11 @@ impl WatcherWorker {
         }
     }
 
-    fn do_watch_key(&mut self, key: WatcherKey, sender: InitialWatchSender) {
+    fn handle_watch_response(&mut self, id: WatchId, response: TransformedWatchResponse) {
+        self.watched_keys.update_from_watch_response(id, response);
+    }
+
+    fn do_watch_key(&mut self, key: Key, sender: InitialWatchSender) {
         // If the sender is closed, we'll just return, since we can't send the result.
         if sender.is_closed() {
             return;
@@ -366,7 +506,7 @@ impl WatcherWorker {
         };
 
         // Check to see if we're already watching that key, so we can duplicate the watcher:
-        if let Some(state) = self.streaming_watcher.get_state_by_key(&key) {
+        if let Some(state) = self.watched_keys.get_watch_state_by_key(&key) {
             // We indeed have the key? Let's just send the initial state to the resolver.
             sender
                 .send(Ok(Watched {

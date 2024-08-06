@@ -15,7 +15,7 @@ use crate::{watcher::fsm::CancelSource, WatchId};
 
 use super::{
     fsm::{TransformedWatchResponse, WatcherFsm},
-    BoxFuture, WatcherKey,
+    BoxFuture, Key,
 };
 
 pub(crate) struct WatcherFsmClient {
@@ -121,7 +121,7 @@ impl WatcherFsmClient {
         }
     }
 
-    pub(crate) fn add_watcher(&mut self, key: WatcherKey, revision: i64) -> WatchId {
+    pub(crate) fn add_watcher(&mut self, key: Key, revision: i64) -> WatchId {
         // fixme: can we get rid of the clone?
         let watch_id = self.fsm.add_watcher(key.clone(), revision);
         tracing::info!("added watcher, key: {:?}, watch_id: {:?}", key, watch_id);
@@ -130,7 +130,7 @@ impl WatcherFsmClient {
         watch_id
     }
 
-    pub(crate) fn cancel_watcher(&mut self, watch_id: WatchId) -> Option<WatcherKey> {
+    pub(crate) fn cancel_watcher(&mut self, watch_id: WatchId) -> Option<Key> {
         let key = self.fsm.cancel_watcher(watch_id, &CancelSource::Client)?;
         tracing::info!(
             "cancelled watcher, key: {:?}, watch_id: {:?}",

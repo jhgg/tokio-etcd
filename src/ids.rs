@@ -45,7 +45,7 @@ impl LeaseId {
 #[derive(Default)]
 pub(crate) struct IdFastHasherBuilder;
 
-struct IdFastHasher(i64);
+pub(crate) struct IdFastHasher(i64);
 
 impl std::hash::BuildHasher for IdFastHasherBuilder {
     type Hasher = IdFastHasher;
