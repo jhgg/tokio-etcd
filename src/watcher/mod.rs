@@ -95,7 +95,7 @@ pub struct Watched {
 enum WatchReceiverDropGuard {
     Armed {
         tx: UnboundedSender<WorkerMessage>,
-        watch_id: WatchId,
+        id: WatchId,
     },
     Disarmed,
 }
@@ -108,7 +108,7 @@ impl WatchReceiverDropGuard {
 
 impl Drop for WatchReceiverDropGuard {
     fn drop(&mut self) {
-        if let Self::Armed { tx, watch_id } = self {
+        if let Self::Armed { tx, id: watch_id } = self {
             tx.send(WorkerMessage::ReceiverDropped(*watch_id)).ok();
         }
     }
@@ -139,12 +139,12 @@ impl WatcherReceiver {
     fn new(
         receiver: broadcast::Receiver<Result<WatcherValue, WatchCancelledByServer>>,
         tx: UnboundedSender<WorkerMessage>,
-        watch_id: WatchId,
+        id: WatchId,
     ) -> Self {
         Self {
             receiver: ReceiverState::Active {
                 receiver,
-                drop_guard: WatchReceiverDropGuard::Armed { tx, watch_id },
+                drop_guard: WatchReceiverDropGuard::Armed { tx, id },
             },
         }
     }
@@ -254,10 +254,6 @@ impl KeySet {
         Some(&self.watched_keys[watch_id])
     }
 
-    fn get_watch_state_by_id(&self, id: &WatchId) -> Option<&KeyWatchState> {
-        self.watched_keys.get(id)
-    }
-
     fn update_from_watch_response(&mut self, id: WatchId, response: TransformedWatchResponse) {
         let Some(state) = self.watched_keys.get_mut(&id) else {
             return;
@@ -344,6 +340,10 @@ struct WatcherWorker {
 }
 
 impl WatcherWorker {
+    const CONCURRENT_SYNC_LIMIT: usize = 5;
+    const PROGRESS_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
+    const BROADCAST_CHANNEL_CAPACITY: usize = 16;
+
     fn new(
         rx: UnboundedReceiver<WorkerMessage>,
         weak_tx: WeakUnboundedSender<WorkerMessage>,
@@ -356,7 +356,11 @@ impl WatcherWorker {
             kv_client,
             in_progress_reads: Default::default(),
             watched_keys: Default::default(),
-            streaming_watcher: WatcherFsmClient::new(watch_client, Duration::from_secs(60)),
+            streaming_watcher: WatcherFsmClient::new(
+                watch_client,
+                Self::PROGRESS_REQUEST_INTERVAL,
+                Self::CONCURRENT_SYNC_LIMIT,
+            ),
             range_request_join_set: JoinSet::new(),
         }
     }
@@ -446,13 +450,8 @@ impl WatcherWorker {
                     let watch_id = self.streaming_watcher.add_watcher(key.clone(), revision);
                     let state = self
                         .watched_keys
-                        .insert(
-                            key.clone(),
-                            watch_id,
-                            16, // fixme, dont hardcode
-                            value,
-                        )
-                        .expect("should not fail");
+                        .insert(key, watch_id, Self::BROADCAST_CHANNEL_CAPACITY, value)
+                        .expect("invariant: insert should not fail");
 
                     for sender in senders {
                         if sender.is_closed() {

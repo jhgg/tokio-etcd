@@ -11,7 +11,7 @@ use tokio_etcd_grpc_client::{
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Response, Status, Streaming};
 
-use crate::{watcher::fsm::CancelSource, WatchId};
+use crate::WatchId;
 
 use super::{
     fsm::{TransformedWatchResponse, WatcherFsm},
@@ -21,33 +21,49 @@ use super::{
 pub(crate) struct WatcherFsmClient {
     watch_client: WatchClient<AuthedChannel>,
     connection_state: ConnectionState,
-    fsm: WatcherFsm,
+    watcher_fsm: WatcherFsm,
     progress_request_interval: Duration,
     connection_incarnation: u64,
 }
 
 impl WatcherFsmClient {
-    // When connecting to etcd, we'll only allow a certain number of watchers to sync concurrently, to avoid
-    // overwhelming the server.
-    const CONCURRENT_SYNC_LIMIT: usize = 5;
-
-    pub(crate) fn new(
+    pub fn new(
         watch_client: WatchClient<AuthedChannel>,
         progress_request_interval: Duration,
+        concurrent_sync_limit: usize,
     ) -> Self {
         Self {
             watch_client,
-            fsm: WatcherFsm::new(Self::CONCURRENT_SYNC_LIMIT),
+            watcher_fsm: WatcherFsm::new(concurrent_sync_limit),
             connection_state: ConnectionState::Disconnected,
             connection_incarnation: 0,
             progress_request_interval,
         }
     }
 
+    pub fn add_watcher(&mut self, key: Key, revision: i64) -> WatchId {
+        // fixme: can we get rid of the clone?
+        let watch_id = self.do_fsm_action(|fsm| fsm.add_watcher(key.clone(), revision));
+        tracing::info!("added watcher, key: {:?}, watch_id: {:?}", key, watch_id);
+
+        watch_id
+    }
+
+    pub fn cancel_watcher(&mut self, watch_id: WatchId) -> Option<Key> {
+        let key = self.do_fsm_action(|fsm| fsm.cancel_watcher(watch_id))?;
+        tracing::info!(
+            "cancelled watcher, key: {:?}, watch_id: {:?}",
+            key,
+            watch_id
+        );
+
+        Some(key)
+    }
+
     /// This future is cancel safe.
     ///
     /// Progresses the connection forward.
-    pub(crate) async fn next(&mut self) -> (WatchId, TransformedWatchResponse) {
+    pub async fn next(&mut self) -> (WatchId, TransformedWatchResponse) {
         loop {
             match &mut self.connection_state {
                 // When we're disconnected, we'll just stay pending forever, as we'll expect this
@@ -94,11 +110,9 @@ impl WatcherFsmClient {
                 ConnectionState::Connected(connected) => {
                     match connected.next_message().await {
                         Ok(response) => {
-                            let response = self.fsm.progress(response);
-                            self.sync_connection();
-
-                            // We have a response to return upstream.
-                            if let Some(response) = response {
+                            if let Some(response) =
+                                self.do_fsm_action(|fsm| fsm.process_watch_response(response))
+                            {
                                 return response;
                             }
                         }
@@ -121,29 +135,17 @@ impl WatcherFsmClient {
         }
     }
 
-    pub(crate) fn add_watcher(&mut self, key: Key, revision: i64) -> WatchId {
-        // fixme: can we get rid of the clone?
-        let watch_id = self.fsm.add_watcher(key.clone(), revision);
-        tracing::info!("added watcher, key: {:?}, watch_id: {:?}", key, watch_id);
+    /// Convenience method:
+    ///
+    /// Do something with the FSM, and then synchronize the connection.
+    fn do_fsm_action<T>(&mut self, func: impl FnOnce(&mut WatcherFsm) -> T) -> T {
+        let result = func(&mut self.watcher_fsm);
         self.sync_connection();
-
-        watch_id
-    }
-
-    pub(crate) fn cancel_watcher(&mut self, watch_id: WatchId) -> Option<Key> {
-        let key = self.fsm.cancel_watcher(watch_id, &CancelSource::Client)?;
-        tracing::info!(
-            "cancelled watcher, key: {:?}, watch_id: {:?}",
-            key,
-            watch_id
-        );
-        self.sync_connection();
-
-        Some(key)
+        result
     }
 
     fn sync_connection(&mut self) {
-        if self.fsm.is_empty() {
+        if self.watcher_fsm.is_empty() {
             // There are no watchers to sync, so we can disconnect.
             if self.connection_state.is_disconnected() {
                 return;
@@ -154,16 +156,16 @@ impl WatcherFsmClient {
             // There are watchers to sync, so we should connect.
             self.do_connect();
         } else if let Some(connected) = self.connection_state.connected() {
-            while let Some(watch_request) = self.fsm.next_watch_request_to_send() {
+            while let Some(watch_request) = self.watcher_fsm.next_watch_request_to_send() {
                 connected.send(watch_request);
             }
         }
     }
 
     fn do_connect(&mut self) {
-        self.fsm.reset_for_new_connection();
+        self.watcher_fsm.reset_for_new_connection();
 
-        if self.fsm.is_empty() {
+        if self.watcher_fsm.is_empty() {
             self.connection_state = ConnectionState::Disconnected;
             return;
         }
@@ -173,12 +175,12 @@ impl WatcherFsmClient {
         tracing::info!(
             "connecting to etcd for new watcher set (incarnation: {}, unsynced: {})",
             self.connection_incarnation,
-            self.fsm.len(),
+            self.watcher_fsm.len(),
         );
 
         // We'll start by constructing all the initial watch requests.
         let (sender, receiver) = unbounded_channel();
-        while let Some(watch_request) = self.fsm.next_watch_request_to_send() {
+        while let Some(watch_request) = self.watcher_fsm.next_watch_request_to_send() {
             sender.send(watch_request).ok();
         }
 

@@ -41,11 +41,11 @@ struct UpdatableWatcherState<'a> {
     revision: &'a mut i64,
 }
 
-pub(crate) struct WatcherEvent {
+pub struct WatcherEvent {
     /// The key (in bytes) that has been updated.
-    key: Arc<[u8]>,
+    pub key: Arc<[u8]>,
     /// The value that the key has been updated to.
-    pub(crate) value: WatcherValue,
+    pub value: WatcherValue,
 }
 
 #[derive(Clone, Debug)]
@@ -128,7 +128,7 @@ impl WatcherState {
 }
 
 pub(crate) struct WatcherFsm {
-    next_watch_id: WatchId,
+    next_id: WatchId,
     // fixme: move this out of watcher map and into the worker.
     states: HashMap<WatchId, WatcherState, IdFastHasherBuilder>,
     unsynced_watchers: VecDeque<WatchId>,
@@ -141,7 +141,7 @@ pub(crate) struct WatcherFsm {
 impl WatcherFsm {
     pub(crate) fn new(concurrent_sync_limit: usize) -> Self {
         WatcherFsm {
-            next_watch_id: WatchId(0),
+            next_id: WatchId(0),
             states: Default::default(),
             unsynced_watchers: Default::default(),
             syncing_watchers: Default::default(),
@@ -163,21 +163,21 @@ impl WatcherFsm {
     /// the key.
     ///
     /// The watcher starts out as unsynced, and will progress towards sync as the connecion managing this
-    /// set progresses.
+    /// fsm progresses.
     pub(crate) fn add_watcher(&mut self, key: Key, revision: i64) -> WatchId {
-        let watch_id = self.next_watch_id;
-        self.next_watch_id = watch_id.next();
+        let id = self.next_id;
+        self.next_id = id.next();
         self.states.insert(
-            watch_id,
+            id,
             WatcherState {
                 key,
                 sync_state: WatcherSyncState::Unsynced,
                 revision,
-                id: watch_id,
+                id,
             },
         );
-        self.unsynced_watchers.push_back(watch_id);
-        watch_id
+        self.unsynced_watchers.push_back(id);
+        id
     }
 
     /// Returns the next watch request to send to the etcd server in order to sync the connection.
@@ -204,27 +204,22 @@ impl WatcherFsm {
         self.pending_cancels.pop_front().map(|w| w.cancel_request())
     }
 
+    pub(crate) fn cancel_watcher(&mut self, watch_id: WatchId) -> Option<Key> {
+        self.cancel_watcher_with_source(watch_id, CancelSource::Client)
+    }
+
     /// Cancels a watcher by its watch id.
-    pub(crate) fn cancel_watcher(
+    fn cancel_watcher_with_source(
         &mut self,
-        watch_id: WatchId,
-        cancel_source: &CancelSource,
+        id: WatchId,
+        cancel_source: CancelSource,
     ) -> Option<Key> {
         let WatcherState {
             key, sync_state, ..
-        } = self.states.remove(&watch_id)?;
+        } = self.states.remove(&id)?;
 
-        self.fragmented_responses.remove(&watch_id);
-
-        match sync_state {
-            WatcherSyncState::Unsynced => {
-                self.unsynced_watchers.retain(|id| *id != watch_id);
-            }
-            WatcherSyncState::Syncing => {
-                self.syncing_watchers.retain(|id| *id != watch_id);
-            }
-            WatcherSyncState::Synced => {}
-        }
+        self.fragmented_responses.remove(&id);
+        self.apply_to_state_container(sync_state, |c| c.retain(|item| *item != id));
 
         match cancel_source {
             CancelSource::Client => {
@@ -232,7 +227,7 @@ impl WatcherFsm {
                 // to the etcd server, and we should send a cancel request. Otherwise, we can just remove
                 // the watcher from the set, as the server never knew about it.
                 if sync_state != WatcherSyncState::Unsynced {
-                    self.pending_cancels.push_back(watch_id);
+                    self.pending_cancels.push_back(id);
                 }
             }
             CancelSource::Server => {}
@@ -343,7 +338,7 @@ impl WatcherFsm {
     /// Processes a watch response from the etcd server.
     ///
     /// Progresses the finite state machine forward.
-    pub(crate) fn progress(
+    pub(crate) fn process_watch_response(
         &mut self,
         response: WatchResponse,
     ) -> Option<(WatchId, TransformedWatchResponse)> {
@@ -381,7 +376,7 @@ impl WatcherFsm {
         };
 
         if response.canceled {
-            self.cancel_watcher(watch_id, &CancelSource::Server);
+            self.cancel_watcher_with_source(watch_id, CancelSource::Server);
 
             Some((
                 watch_id,
@@ -427,7 +422,7 @@ impl WatcherFsm {
     }
 }
 
-pub enum CancelSource {
+enum CancelSource {
     /// The client requested the watcher to be cancelled.
     Client,
     /// The server cancelled the watcher.
@@ -435,12 +430,14 @@ pub enum CancelSource {
 }
 
 pub enum TransformedWatchResponse {
+    /// The watcher was cancelled by the server.
     Cancelled(WatchCancelledByServer),
+    /// The watcher emitted the following events.
     Events(Vec<WatcherEvent>),
 }
 
 #[derive(Debug, Error, Clone)]
-#[error("watch cancelled: {reason}")]
+#[error("watch cancelled by server: {reason}")]
 pub struct WatchCancelledByServer {
     pub reason: Arc<str>,
 }
