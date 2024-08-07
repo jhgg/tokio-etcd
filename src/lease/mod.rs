@@ -34,8 +34,25 @@ struct LeaseHandle {
 }
 
 impl LeaseHandle {
-    fn lease_id(&self) -> i64 {
-        self.inner.lease_id
+    fn released(&self) -> bool {
+        self.inner.lease_released.load(Ordering::Release)
+    }
+
+    /// Returns the lease id from the handle, or None if the lease has expired.
+    pub fn lease_id(&self) -> Option<i64> {
+        self.released().then_some(self.inner.lease_id)
+    }
+
+    /// Monitors the lease, resolving if the lease for whatever reason was revoked or expired by the server
+    /// (and thus should not be used anymore).
+    pub async fn monitor(&self) {
+        loop {
+            if self.released() {
+                break;
+            }
+
+            self.inner.lease_notify.notified().await;
+        }
     }
 }
 
@@ -107,6 +124,7 @@ impl LeaseWorker {
         loop {
             match self.state {
                 LeaseWorkerState::NoStream => {
+                    // technically, we should race this with the ka request below.
                     if self.dropped_receiver.try_recv().is_err() {
                         self.revoke_lease().await;
                         break;
@@ -118,7 +136,7 @@ impl LeaseWorker {
                     })
                     .ok();
 
-                    let mut lease_ka_streaming = match self
+                    match self
                         .lease_client
                         .lease_keep_alive(UnboundedReceiverStream::new(rx))
                         .await
@@ -136,7 +154,7 @@ impl LeaseWorker {
                             );
                             sleep(Duration::from_secs(3)).await;
                         }
-                    };
+                    }
                 }
                 LeaseWorkerState::HasStream { stream, out } => {
                     enum Action {
@@ -187,12 +205,18 @@ impl LeaseWorker {
                             );
 
                             if response.ttl > 0 {
+                                tracing::info!(
+                                    "lease {} has been kept-alive, new TTL: {}",
+                                    self.handle_inner.lease_id,
+                                    response.ttl
+                                );
                                 self.interval.reset_after(Duration::from_millis(
                                     (((response.ttl * 1000) as f32) * 0.5) as _,
                                 ));
                                 self.timeout_at =
                                     Instant::now() + Duration::from_secs(response.ttl as _);
                             } else {
+                                tracing::error!("lease has expired :(");
                                 self.state = LeaseWorkerState::Revoked;
                                 break;
                             }
