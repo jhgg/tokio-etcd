@@ -21,16 +21,31 @@ use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tonic::{Status, Streaming};
 
 struct LeaseHandleInner {
-    // need to figure out how to signal that the lease is dead?
-    lease_notify: Notify,
-    lease_released: AtomicBool,
-    lease_id: i64,
+    /// Notify is updated when lease_released is changed.
+    notify: Notify,
+    revoked: AtomicBool,
+    id: i64,
+}
+
+impl LeaseHandleInner {
+    fn new(id: i64) -> Self {
+        Self {
+            id,
+            notify: Notify::new(),
+            revoked: AtomicBool::new(false),
+        }
+    }
+
+    fn set_revoked(&self, released: bool) {
+        self.revoked.store(released, Ordering::Release);
+        self.notify.notify_waiters();
+    }
 }
 
 #[derive(Clone)]
 pub struct LeaseHandle {
     inner: Arc<LeaseHandleInner>,
-    dropped_sender: Arc<oneshot::Sender<()>>,
+    _dropped_sender: Arc<oneshot::Sender<()>>,
 }
 
 impl LeaseHandle {
@@ -51,14 +66,10 @@ impl LeaseHandle {
             .into_inner();
 
         let (dropped_sender, dropped_receiver) = oneshot::channel();
-        let handle_inner = Arc::new(LeaseHandleInner {
-            lease_id: lease.id,
-            lease_notify: Notify::new(),
-            lease_released: AtomicBool::new(false),
-        });
+        let handle_inner = Arc::new(LeaseHandleInner::new(lease.id));
         let handle = LeaseHandle {
             inner: handle_inner.clone(),
-            dropped_sender: Arc::new(dropped_sender),
+            _dropped_sender: Arc::new(dropped_sender),
         };
 
         let mut interval = interval(Duration::from_secs((ttl.as_secs_f64() * 0.75) as _));
@@ -70,7 +81,6 @@ impl LeaseHandle {
             interval,
             state: LeaseWorkerState::NoStream,
             timeout_at: Instant::now() + ttl,
-            ttl,
         };
 
         tokio::task::spawn(worker.run());
@@ -79,12 +89,12 @@ impl LeaseHandle {
     }
 
     fn released(&self) -> bool {
-        self.inner.lease_released.load(Ordering::Release)
+        self.inner.revoked.load(Ordering::Acquire)
     }
 
     /// Returns the lease id from the handle, or None if the lease has expired.
     pub fn lease_id(&self) -> Option<i64> {
-        self.released().then_some(self.inner.lease_id)
+        self.released().then_some(self.inner.id)
     }
 
     /// Monitors the lease, resolving if the lease for whatever reason was revoked or expired by the server
@@ -95,7 +105,7 @@ impl LeaseHandle {
                 break;
             }
 
-            self.inner.lease_notify.notified().await;
+            self.inner.notify.notified().await;
         }
     }
 }
@@ -107,16 +117,6 @@ enum LeaseWorkerState {
         out: UnboundedSender<LeaseKeepAliveRequest>,
     },
     Revoked,
-}
-
-struct LeaseWorker {
-    lease_client: LeaseClient<AuthedChannel>,
-    handle_inner: Arc<LeaseHandleInner>,
-    dropped_receiver: oneshot::Receiver<()>,
-    state: LeaseWorkerState,
-    interval: Interval,
-    timeout_at: Instant,
-    ttl: Duration,
 }
 
 impl LeaseWorker {
@@ -132,7 +132,7 @@ impl LeaseWorker {
 
                     let (tx, rx) = unbounded_channel();
                     tx.send(LeaseKeepAliveRequest {
-                        id: self.handle_inner.lease_id,
+                        id: self.handle_inner.id,
                     })
                     .ok();
 
@@ -149,8 +149,9 @@ impl LeaseWorker {
                         }
                         Err(error) => {
                             tracing::error!(
-                                "error establishing lease channel for lease: {}",
-                                self.handle_inner.lease_id
+                                "error establishing lease channel for lease: {}, error: {:?}",
+                                self.handle_inner.id,
+                                error
                             );
                             sleep(Duration::from_secs(3)).await;
                         }
@@ -179,35 +180,35 @@ impl LeaseWorker {
                         }
                         Action::RequestKeepAlive => {
                             out.send(LeaseKeepAliveRequest {
-                                id: self.handle_inner.lease_id,
+                                id: self.handle_inner.id,
                             })
                             .ok();
                         }
                         Action::KeepAliveResponse(None) => {
                             tracing::info!(
                                 "lease {} keep-alive channel closed, re-establishing",
-                                self.handle_inner.lease_id
+                                self.handle_inner.id
                             );
                             self.state = LeaseWorkerState::NoStream;
                         }
                         Action::KeepAliveResponse(Some(Err(status))) => {
                             tracing::error!(
                                 "error renewing lease {}, keep-alive channel returned error: {:?}, will retry immediately",
-                                self.handle_inner.lease_id,
+                                self.handle_inner.id,
                                 status
                             );
                             self.interval.reset_immediately();
                         }
                         Action::KeepAliveResponse(Some(Ok(response))) => {
                             assert_eq!(
-                                response.id, self.handle_inner.lease_id,
+                                response.id, self.handle_inner.id,
                                 "bug: lease id does not match"
                             );
 
                             if response.ttl > 0 {
                                 tracing::info!(
                                     "lease {} has been kept-alive, new TTL: {}",
-                                    self.handle_inner.lease_id,
+                                    self.handle_inner.id,
                                     response.ttl
                                 );
                                 self.interval.reset_after(Duration::from_millis(
@@ -216,7 +217,10 @@ impl LeaseWorker {
                                 self.timeout_at =
                                     Instant::now() + Duration::from_secs(response.ttl as _);
                             } else {
-                                tracing::error!("lease has expired :(");
+                                tracing::error!(
+                                    "lease {} has expired before we could keep it alive",
+                                    self.handle_inner.id
+                                );
                                 self.state = LeaseWorkerState::Revoked;
                                 break;
                             }
@@ -224,10 +228,7 @@ impl LeaseWorker {
                     }
                 }
                 LeaseWorkerState::Revoked => {
-                    self.handle_inner
-                        .lease_released
-                        .store(true, Ordering::Acquire);
-                    self.handle_inner.lease_notify.notify_waiters();
+                    self.handle_inner.set_revoked(true);
                     break;
                 }
             }
@@ -240,7 +241,7 @@ impl LeaseWorker {
                 match self
                     .lease_client
                     .lease_revoke(LeaseRevokeRequest {
-                        id: self.handle_inner.lease_id,
+                        id: self.handle_inner.id,
                     })
                     .await
                 {
@@ -256,14 +257,23 @@ impl LeaseWorker {
 
         match timeout_at(self.timeout_at, revoke_future).await {
             Ok(_) => {
-                tracing::warn!("revoked lease {} successfully.", self.handle_inner.lease_id);
+                tracing::warn!("revoked lease {} successfully.", self.handle_inner.id);
             }
             Err(_) => {
                 tracing::warn!(
                     "timed out trying to issue revoke lease {} call before the lease expired.",
-                    self.handle_inner.lease_id
+                    self.handle_inner.id
                 );
             }
         }
     }
+}
+
+struct LeaseWorker {
+    lease_client: LeaseClient<AuthedChannel>,
+    handle_inner: Arc<LeaseHandleInner>,
+    dropped_receiver: oneshot::Receiver<()>,
+    state: LeaseWorkerState,
+    interval: Interval,
+    timeout_at: Instant,
 }
