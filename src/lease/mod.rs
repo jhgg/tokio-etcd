@@ -36,12 +36,24 @@ impl LeaseHandleInner {
         }
     }
 
-    fn set_revoked(&self, released: bool) {
-        self.revoked.store(released, Ordering::Release);
+    fn set_revoked(&self) {
+        self.revoked.store(true, Ordering::Release);
         self.notify.notify_waiters();
+    }
+
+    fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
     }
 }
 
+/// A lease handle represents a held etcd lease.
+///
+/// The lease handle can be cloned, but when all copies of the lease handle are dropped, then the lease will be
+/// revoked on the server.
+///
+/// However, there is a chance that the lease may be revoked if this client has difficulty issuing a lease keep-alive
+/// request before the lease expires. The [`LeaseHandle::monitor`] method is provided to check for this so you
+/// can act accordingly in your program.
 #[derive(Clone)]
 pub struct LeaseHandle {
     inner: Arc<LeaseHandleInner>,
@@ -88,20 +100,16 @@ impl LeaseHandle {
         Ok(handle)
     }
 
-    fn released(&self) -> bool {
-        self.inner.revoked.load(Ordering::Acquire)
-    }
-
-    /// Returns the lease id from the handle, or None if the lease has expired.
+    /// Returns the lease id, or None if the lease has expired.
     pub fn lease_id(&self) -> Option<i64> {
-        self.released().then_some(self.inner.id)
+        self.inner.is_revoked().then_some(self.inner.id)
     }
 
     /// Monitors the lease, resolving if the lease for whatever reason was revoked or expired by the server
     /// (and thus should not be used anymore).
     pub async fn monitor(&self) {
         loop {
-            if self.released() {
+            if self.inner.is_revoked() {
                 break;
             }
 
@@ -124,23 +132,20 @@ impl LeaseWorker {
         loop {
             match &mut self.state {
                 LeaseWorkerState::NoStream => {
-                    // technically, we should race this with the ka request below.
-                    if self.dropped_receiver.try_recv().is_err() {
-                        self.revoke_lease().await;
-                        break;
-                    }
-
                     let (tx, rx) = unbounded_channel();
                     tx.send(LeaseKeepAliveRequest {
                         id: self.handle_inner.id,
                     })
                     .ok();
 
-                    match self
-                        .lease_client
-                        .lease_keep_alive(UnboundedReceiverStream::new(rx))
-                        .await
-                    {
+                    let keep_alive_result = tokio::select! {
+                        res = self.lease_client.lease_keep_alive(UnboundedReceiverStream::new(rx)) => res,
+                        _ = &mut self.dropped_receiver => {
+                            self.revoke_lease().await;
+                            break;
+                        }
+                    };
+                    match keep_alive_result {
                         Ok(response) => {
                             self.state = LeaseWorkerState::HasStream {
                                 stream: response.into_inner(),
@@ -193,11 +198,11 @@ impl LeaseWorker {
                         }
                         Action::KeepAliveResponse(Some(Err(status))) => {
                             tracing::error!(
-                                "error renewing lease {}, keep-alive channel returned error: {:?}, will retry immediately",
+                                "error renewing lease {}, keep-alive channel returned error: {:?}, will retry",
                                 self.handle_inner.id,
                                 status
                             );
-                            self.interval.reset_immediately();
+                            self.interval.reset_after(Duration::from_secs(1));
                         }
                         Action::KeepAliveResponse(Some(Ok(response))) => {
                             assert_eq!(
@@ -228,7 +233,7 @@ impl LeaseWorker {
                     }
                 }
                 LeaseWorkerState::Revoked => {
-                    self.handle_inner.set_revoked(true);
+                    self.handle_inner.set_revoked();
                     break;
                 }
             }

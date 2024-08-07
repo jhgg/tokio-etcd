@@ -61,6 +61,8 @@ impl Client {
     /// as long as the returned [`lease::LeaseHandle`] is alive.
     ///
     /// The lease handle provides methods for checking if the lease is still valid.
+    ///
+    /// `ttl` must be above 10 seconds.
     pub async fn grant_lease(&self, ttl: Duration) -> Result<LeaseHandle, Status> {
         LeaseHandle::grant(self.grpc_client.lease(), ttl).await
     }
