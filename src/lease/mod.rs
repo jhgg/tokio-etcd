@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::Duration,
@@ -14,8 +14,8 @@ use tokio::{
     time::{interval, sleep, timeout_at, Instant, Interval},
 };
 use tokio_etcd_grpc_client::{
-    lease_client, AuthClient, AuthedChannel, LeaseClient, LeaseGrantRequest, LeaseKeepAliveRequest,
-    LeaseKeepAliveResponse, LeaseRevokeRequest,
+    AuthedChannel, LeaseClient, LeaseGrantRequest, LeaseKeepAliveRequest, LeaseKeepAliveResponse,
+    LeaseRevokeRequest,
 };
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tonic::{Status, Streaming};
@@ -28,12 +28,56 @@ struct LeaseHandleInner {
 }
 
 #[derive(Clone)]
-struct LeaseHandle {
+pub struct LeaseHandle {
     inner: Arc<LeaseHandleInner>,
     dropped_sender: Arc<oneshot::Sender<()>>,
 }
 
 impl LeaseHandle {
+    pub(crate) async fn grant(
+        mut lease_client: LeaseClient<AuthedChannel>,
+        ttl: Duration,
+    ) -> Result<LeaseHandle, Status> {
+        if ttl < Duration::from_secs(10) {
+            return Err(Status::invalid_argument("ttl must be above 10 seconds"));
+        }
+
+        let lease = lease_client
+            .lease_grant(LeaseGrantRequest {
+                ttl: ttl.as_secs() as _,
+                id: 0, // server will provide us a lease id.
+            })
+            .await?
+            .into_inner();
+
+        let (dropped_sender, dropped_receiver) = oneshot::channel();
+        let handle_inner = Arc::new(LeaseHandleInner {
+            lease_id: lease.id,
+            lease_notify: Notify::new(),
+            lease_released: AtomicBool::new(false),
+        });
+        let handle = LeaseHandle {
+            inner: handle_inner.clone(),
+            dropped_sender: Arc::new(dropped_sender),
+        };
+
+        let mut interval = interval(Duration::from_secs((ttl.as_secs_f64() * 0.75) as _));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let worker = LeaseWorker {
+            lease_client,
+            handle_inner,
+            dropped_receiver,
+            interval,
+            state: LeaseWorkerState::NoStream,
+            timeout_at: Instant::now() + ttl,
+            ttl,
+        };
+
+        tokio::task::spawn(worker.run());
+
+        Ok(handle)
+    }
+
     fn released(&self) -> bool {
         self.inner.lease_released.load(Ordering::Release)
     }
@@ -68,7 +112,7 @@ enum LeaseWorkerState {
 struct LeaseWorker {
     lease_client: LeaseClient<AuthedChannel>,
     handle_inner: Arc<LeaseHandleInner>,
-    dropped_receiver: oneshot::Receiver<_>,
+    dropped_receiver: oneshot::Receiver<()>,
     state: LeaseWorkerState,
     interval: Interval,
     timeout_at: Instant,
@@ -76,53 +120,9 @@ struct LeaseWorker {
 }
 
 impl LeaseWorker {
-    async fn grant(
-        lease_client: LeaseClient<AuthedChannel>,
-        ttl: Duration,
-    ) -> Result<LeaseHandle, Status> {
-        if ttl < Duration::from_secs(10) {
-            return Err(Status::invalid_argument("ttl must be above 10 seconds"));
-        }
-
-        let lease = lease_client
-            .lease_grant(LeaseGrantRequest {
-                ttl: ttl.as_secs() as _,
-                id: 0, // server will provide us a lease id.
-            })
-            .await?
-            .into_inner();
-
-        let (dropped_sender, dropped_receiver) = oneshot::channel();
-        let inner = Arc::new(LeaseHandleInner {
-            lease_id: lease.id,
-            lease_notify: Notify::new(),
-            lease_released: AtomicBool::new(false),
-        });
-        let handle = LeaseHandle {
-            inner,
-            dropped_sender: Arc::new(dropped_sender),
-        };
-
-        let mut interval = interval(Duration::from_secs((ttl.as_secs_f64() * 0.75) as _));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let worker = LeaseWorker {
-            lease_client,
-            handle_inner: inner.clone(),
-            dropped_receiver,
-            interval,
-            state: LeaseWorkerState::NoStream,
-            timeout_at: Instant::now() + ttl,
-            ttl,
-        };
-
-        tokio::task::spawn(worker.run());
-
-        Ok(handle)
-    }
-
     async fn run(mut self) {
         loop {
-            match self.state {
+            match &mut self.state {
                 LeaseWorkerState::NoStream => {
                     // technically, we should race this with the ka request below.
                     if self.dropped_receiver.try_recv().is_err() {
@@ -234,7 +234,7 @@ impl LeaseWorker {
         }
     }
 
-    async fn revoke_lease(self) {
+    async fn revoke_lease(mut self) {
         let revoke_future = async {
             loop {
                 match self
