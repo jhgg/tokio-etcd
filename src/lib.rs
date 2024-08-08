@@ -11,6 +11,7 @@ pub mod watcher;
 
 pub use ids::{LeaseId, WatchId};
 use lease::LeaseHandle;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, WeakUnboundedSender};
 pub use tokio_etcd_grpc_client::ClientEndpointConfig;
 use tokio_etcd_grpc_client::EtcdGrpcClient;
 
@@ -93,6 +94,36 @@ impl<T> WeakSingleton<T> {
             let arc = Arc::new(init());
             *lock = Arc::downgrade(&arc);
             arc
+        }
+    }
+}
+
+struct WeakUnboundedSenderSingleton<T> {
+    inner: Mutex<WeakUnboundedSender<T>>,
+}
+
+impl<T> WeakUnboundedSenderSingleton<T> {
+    fn new() -> Self {
+        // This is kinda awful, but tokio provides no way to create a "weak unbounded sender" without first creating a tx/rx pair.
+        let (tx, rx) = unbounded_channel();
+        let weak_tx = tx.downgrade();
+        drop(rx);
+
+        Self {
+            inner: Mutex::new(weak_tx),
+        }
+    }
+
+    fn get_or_init(&self, init: impl FnOnce() -> UnboundedSender<T>) -> UnboundedSender<T> {
+        let mut lock = self.inner.lock().unwrap();
+        if let Some(inner) = lock.upgrade() {
+            inner
+        } else {
+            let tx = init();
+            let weak_tx = tx.downgrade();
+
+            *lock = weak_tx;
+            tx
         }
     }
 }
