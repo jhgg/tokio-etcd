@@ -81,24 +81,24 @@ impl WatcherFsmClient {
                             self.progress_request_interval,
                             sender,
                         );
-                        self.connection_state = ConnectionState::Connected(connected);
-                        self.backoff.succeed();
                         tracing::info!(
                             "connected to etcd successfully, incarnation: {}",
                             self.connection_incarnation
                         );
+                        self.connection_state = ConnectionState::Connected(connected);
+                        self.backoff.succeed();
                     }
                     (Err(error), _) => {
                         let reconnect_delay = self.backoff.fail();
+                        tracing::error!(
+                            "failed to connect to etcd: {:?}, incarnation: {}. will reconnect in {:?}.",
+                            error,
+                            self.connection_incarnation,
+                            reconnect_delay
+                        );
                         self.connection_state = ConnectionState::Reconnecting(Box::pin(
                             tokio::time::sleep(reconnect_delay),
                         ));
-                        tracing::error!(
-                                "failed to connect to etcd: {:?}, incarnation: {}. will reconnect in {:?}.",
-                                error,
-                                self.connection_incarnation,
-                                reconnect_delay
-                            );
                     }
                 },
                 // We're reconnecting after being disconnected, we need to sleep before we can reconnect.
@@ -117,15 +117,15 @@ impl WatcherFsmClient {
                     }
                     Err(disconnect_reason) => {
                         let reconnect_delay = self.backoff.fail();
+                        tracing::warn!(
+                            "disconnected from etcd reason: {:?}, incarnation: {}. will reconnect in {:?}",
+                            disconnect_reason,
+                            self.connection_incarnation,
+                            reconnect_delay
+                        );
                         self.connection_state = ConnectionState::Reconnecting(Box::pin(
                             tokio::time::sleep(reconnect_delay),
                         ));
-                        tracing::warn!(
-                                "disconnected from etcd reason: {:?}, incarnation: {}. will reconnect in {:?}",
-                                disconnect_reason,
-                                self.connection_incarnation,
-                                reconnect_delay
-                            );
                     }
                 },
             }
