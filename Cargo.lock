@@ -878,6 +878,7 @@ dependencies = [
  "arc-swap",
  "expect-test",
  "http",
+ "rand",
  "thiserror",
  "tokio",
  "tokio-etcd-grpc-client",

@@ -11,10 +11,10 @@ use tokio_etcd_grpc_client::{
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Response, Status, Streaming};
 
-use crate::WatchId;
+use crate::{utils::backoff::ExponentialBackoff, WatchId};
 
 use super::{
-    fsm::{TransformedWatchResponse, WatcherFsm},
+    fsm::{ProcessedWatchResponse, WatcherFsm},
     BoxFuture, Key,
 };
 
@@ -24,6 +24,7 @@ pub(crate) struct WatcherFsmClient {
     watcher_fsm: WatcherFsm,
     progress_request_interval: Duration,
     connection_incarnation: u64,
+    backoff: ExponentialBackoff,
 }
 
 impl WatcherFsmClient {
@@ -38,6 +39,7 @@ impl WatcherFsmClient {
             connection_state: ConnectionState::Disconnected,
             connection_incarnation: 0,
             progress_request_interval,
+            backoff: ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(10)),
         }
     }
 
@@ -63,7 +65,7 @@ impl WatcherFsmClient {
     /// This future is cancel safe.
     ///
     /// Progresses the connection forward.
-    pub async fn next(&mut self) -> (WatchId, TransformedWatchResponse) {
+    pub async fn next(&mut self) -> (WatchId, ProcessedWatchResponse) {
         loop {
             match &mut self.connection_state {
                 // When we're disconnected, we'll just stay pending forever, as we'll expect this
@@ -72,65 +74,60 @@ impl WatcherFsmClient {
                     return pending().await;
                 }
                 // We're connecting to the etcd server.
-                ConnectionState::Connecting(connecting) => {
-                    match connecting.await {
-                        (Ok(response), sender) => {
-                            let connected = ConnectedWatcherStream::new(
-                                response.into_inner(),
-                                self.progress_request_interval,
-                                sender,
-                            );
-                            self.connection_state = ConnectionState::Connected(connected);
-                            tracing::info!(
-                                "connected to etcd successfully, incarnation: {}",
-                                self.connection_incarnation
-                            );
-                        }
-                        (Err(error), _) => {
-                            // todo: backoff.
-                            let reconnect_delay = Duration::from_secs(5);
-                            self.connection_state = ConnectionState::Reconnecting(Box::pin(
-                                tokio::time::sleep(reconnect_delay),
-                            ));
-                            tracing::error!(
+                ConnectionState::Connecting(connecting) => match connecting.await {
+                    (Ok(response), sender) => {
+                        let connected = ConnectedWatcherStream::new(
+                            response.into_inner(),
+                            self.progress_request_interval,
+                            sender,
+                        );
+                        self.connection_state = ConnectionState::Connected(connected);
+                        self.backoff.succeed();
+                        tracing::info!(
+                            "connected to etcd successfully, incarnation: {}",
+                            self.connection_incarnation
+                        );
+                    }
+                    (Err(error), _) => {
+                        let reconnect_delay = self.backoff.fail();
+                        self.connection_state = ConnectionState::Reconnecting(Box::pin(
+                            tokio::time::sleep(reconnect_delay),
+                        ));
+                        tracing::error!(
                                 "failed to connect to etcd: {:?}, incarnation: {}. will reconnect in {:?}.",
                                 error,
                                 self.connection_incarnation,
                                 reconnect_delay
                             );
-                        }
                     }
-                }
+                },
                 // We're reconnecting after being disconnected, we need to sleep before we can reconnect.
                 ConnectionState::Reconnecting(sleep) => {
                     sleep.await;
                     self.do_connect();
                 }
                 // We're connected, receive a message and handle it.
-                ConnectionState::Connected(connected) => {
-                    match connected.next_message().await {
-                        Ok(response) => {
-                            if let Some(response) =
-                                self.do_fsm_action(|fsm| fsm.process_watch_response(response))
-                            {
-                                return response;
-                            }
+                ConnectionState::Connected(connected) => match connected.next_message().await {
+                    Ok(response) => {
+                        if let Some(response) =
+                            self.do_fsm_action(|fsm| fsm.process_watch_response(response))
+                        {
+                            return response;
                         }
-                        Err(disconnect_reason) => {
-                            // todo: reconnect timeout? backoff?
-                            let reconnect_delay = Duration::from_secs(5);
-                            self.connection_state = ConnectionState::Reconnecting(Box::pin(
-                                tokio::time::sleep(reconnect_delay),
-                            ));
-                            tracing::warn!(
+                    }
+                    Err(disconnect_reason) => {
+                        let reconnect_delay = self.backoff.fail();
+                        self.connection_state = ConnectionState::Reconnecting(Box::pin(
+                            tokio::time::sleep(reconnect_delay),
+                        ));
+                        tracing::warn!(
                                 "disconnected from etcd reason: {:?}, incarnation: {}. will reconnect in {:?}",
                                 disconnect_reason,
                                 self.connection_incarnation,
                                 reconnect_delay
                             );
-                        }
                     }
-                }
+                },
             }
         }
     }

@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use fsm::{TransformedWatchResponse, WatchCancelledByServer, WatcherValue};
+use fsm::{ProcessedWatchResponse, WatchCancelledByServer, WatcherValue};
 use fsm_client::WatcherFsmClient;
 use thiserror::Error;
 use tokio::{
@@ -254,17 +254,17 @@ impl KeySet {
         Some(&self.watched_keys[watch_id])
     }
 
-    fn update_from_watch_response(&mut self, id: WatchId, response: TransformedWatchResponse) {
+    fn update_from_watch_response(&mut self, id: WatchId, response: ProcessedWatchResponse) {
         let Some(state) = self.watched_keys.get_mut(&id) else {
             return;
         };
 
         match response {
-            TransformedWatchResponse::Cancelled(reason) => {
+            ProcessedWatchResponse::Cancelled(reason) => {
                 state.sender.send(Err(reason)).ok();
                 self.remove(id);
             }
-            TransformedWatchResponse::Events(events) => {
+            ProcessedWatchResponse::Events(events) => {
                 for event in events {
                     state.value = event.value;
                     state.sender.send(Ok(state.value.clone())).ok();
@@ -370,7 +370,7 @@ impl WatcherWorker {
             enum Action {
                 WorkerMessage(WorkerMessage),
                 ReadResult(Key, Result<Response<RangeResponse>, Status>),
-                WatchResponse(WatchId, TransformedWatchResponse),
+                WatchResponse(WatchId, ProcessedWatchResponse),
             }
 
             let action = tokio::select! {
@@ -491,7 +491,7 @@ impl WatcherWorker {
         }
     }
 
-    fn handle_watch_response(&mut self, id: WatchId, response: TransformedWatchResponse) {
+    fn handle_watch_response(&mut self, id: WatchId, response: ProcessedWatchResponse) {
         self.watched_keys.update_from_watch_response(id, response);
     }
 

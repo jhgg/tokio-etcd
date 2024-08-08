@@ -298,7 +298,7 @@ impl WatcherFsm {
         self.pending_cancels.clear();
 
         for state in self.states.values_mut() {
-            // This is safe to mutate outside of update_watcher, as we're resetting the containers below:
+            // This is safe to mutate outside of update_watcher, as we've reset the containers above.
             state.sync_state = WatcherSyncState::Unsynced;
         }
         self.unsynced_watchers.extend(self.states.keys());
@@ -341,7 +341,7 @@ impl WatcherFsm {
     pub(crate) fn process_watch_response(
         &mut self,
         response: WatchResponse,
-    ) -> Option<(WatchId, TransformedWatchResponse)> {
+    ) -> Option<(WatchId, ProcessedWatchResponse)> {
         // When receiving a progress notification, we can update the revision for all watchers, so that
         // when we re-sync them, we'll start from a more recent revision, rather than an older one,
         // which might be compacted.
@@ -380,7 +380,7 @@ impl WatcherFsm {
 
             Some((
                 watch_id,
-                TransformedWatchResponse::Cancelled(WatchCancelledByServer {
+                ProcessedWatchResponse::Cancelled(WatchCancelledByServer {
                     reason: response.cancel_reason.into(),
                 }),
             ))
@@ -417,7 +417,7 @@ impl WatcherFsm {
                 watch_events
             })?;
 
-            Some((watch_id, TransformedWatchResponse::Events(events)))
+            Some((watch_id, ProcessedWatchResponse::Events(events)))
         }
     }
 }
@@ -429,7 +429,7 @@ enum CancelSource {
     Server,
 }
 
-pub enum TransformedWatchResponse {
+pub enum ProcessedWatchResponse {
     /// The watcher was cancelled by the server.
     Cancelled(WatchCancelledByServer),
     /// The watcher emitted the following events.

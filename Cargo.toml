@@ -13,6 +13,7 @@ tonic = "0.12.1"
 tracing = { version = "0.1.40", features = ["log"] }
 
 tokio-etcd-grpc-client = { path = "./grpc-client" }
+rand = "0.8.5"
 
 [dev-dependencies]
 expect-test = "1.5.0"
