@@ -2,14 +2,17 @@ use std::{
     sync::{Arc, Mutex, Weak},
     time::Duration,
 };
+use tonic::Status;
 
 pub mod lease;
 pub mod watcher;
+mod ids;
 
 use lease::LeaseHandle;
 pub use tokio_etcd_grpc_client::ClientEndpointConfig;
 use tokio_etcd_grpc_client::EtcdGrpcClient;
-use tonic::Status;
+pub use ids::{LeaseId, WatchId};
+
 
 pub struct Client {
     grpc_client: EtcdGrpcClient,
