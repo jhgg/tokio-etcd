@@ -1,11 +1,18 @@
-use std::sync::{Arc, Mutex, Weak};
+use std::{
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
+use tonic::Status;
 
+pub mod lease;
 pub mod watcher;
 mod ids;
 
+use lease::LeaseHandle;
 pub use tokio_etcd_grpc_client::ClientEndpointConfig;
 use tokio_etcd_grpc_client::EtcdGrpcClient;
 pub use ids::{LeaseId, WatchId};
+
 
 pub struct Client {
     grpc_client: EtcdGrpcClient,
@@ -51,6 +58,16 @@ impl Client {
         self.watcher_singleton.get_or_init(|| {
             watcher::WatcherHandle::new(self.grpc_client.watch(), self.grpc_client.kv())
         })
+    }
+
+    /// Acquires a lease with the given TTL, spawning a background worker to continue to keep-alive the lease
+    /// as long as the returned [`lease::LeaseHandle`] is alive.
+    ///
+    /// The lease handle provides methods for checking if the lease is still valid.
+    ///
+    /// `ttl` must be above 10 seconds.
+    pub async fn grant_lease(&self, ttl: Duration) -> Result<LeaseHandle, Status> {
+        LeaseHandle::grant(self.grpc_client.lease(), ttl).await
     }
 }
 
