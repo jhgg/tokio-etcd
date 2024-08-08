@@ -308,8 +308,8 @@ impl KeySet {
         }))
     }
 
-    fn remove(&mut self, watch_id: WatchId) -> Option<KeyWatchState> {
-        let state = self.watched_keys.remove(&watch_id)?;
+    fn remove(&mut self, id: WatchId) -> Option<KeyWatchState> {
+        let state = self.watched_keys.remove(&id)?;
         self.key_to_watch_id
             .remove(&state.key)
             .expect("invariant: key must exist in key_to_watch_id");
@@ -317,10 +317,10 @@ impl KeySet {
         Some(state)
     }
 
-    fn cancel_watcher_if_no_receivers(&mut self, watch_id: WatchId) -> bool {
-        if let Some(state) = self.watched_keys.get(&watch_id) {
+    fn cancel_watcher_if_no_receivers(&mut self, id: WatchId) -> bool {
+        if let Some(state) = self.watched_keys.get(&id) {
             if state.sender.receiver_count() == 0 {
-                self.remove(watch_id);
+                self.remove(id);
                 return true;
             }
         }
@@ -333,7 +333,7 @@ struct WatcherWorker {
     rx: UnboundedReceiver<WorkerMessage>,
     weak_tx: WeakUnboundedSender<WorkerMessage>,
     in_progress_reads: HashMap<Key, Vec<InitialWatchSender>>,
-    streaming_watcher: WatcherFsmClient,
+    watcher_fsm_client: WatcherFsmClient,
     watched_keys: KeySet,
     kv_client: KvClient<AuthedChannel>,
     range_request_join_set: JoinSet<(Key, Result<Response<RangeResponse>, Status>)>,
@@ -356,7 +356,7 @@ impl WatcherWorker {
             kv_client,
             in_progress_reads: Default::default(),
             watched_keys: Default::default(),
-            streaming_watcher: WatcherFsmClient::new(
+            watcher_fsm_client: WatcherFsmClient::new(
                 watch_client,
                 Self::PROGRESS_REQUEST_INTERVAL,
                 Self::CONCURRENT_SYNC_LIMIT,
@@ -390,7 +390,7 @@ impl WatcherWorker {
                         Err(panic) => panic::resume_unwind(panic.into_panic()),
                     }
                 }
-                (watch_id, response) = self.streaming_watcher.next() => Action::WatchResponse(watch_id, response),
+                (watch_id, response) = self.watcher_fsm_client.next() => Action::WatchResponse(watch_id, response),
             };
 
             match action {
@@ -418,12 +418,15 @@ impl WatcherWorker {
 
     fn cancel_watcher_if_no_receivers(&mut self, watch_id: WatchId) {
         if self.watched_keys.cancel_watcher_if_no_receivers(watch_id) {
-            self.streaming_watcher.cancel_watcher(watch_id);
+            self.watcher_fsm_client.cancel_watcher(watch_id);
         }
     }
 
     fn handle_read_result(&mut self, key: Key, value: Result<Response<RangeResponse>, Status>) {
         let Some(senders) = self.in_progress_reads.remove(&key) else {
+            tracing::warn!(
+                "received read result for key that isn't in progress: {key:?}. ignoring result"
+            );
             return;
         };
 
@@ -447,7 +450,7 @@ impl WatcherWorker {
 
                 // Now, begin watching:
                 let watch_id = {
-                    let watch_id = self.streaming_watcher.add_watcher(key.clone(), revision);
+                    let watch_id = self.watcher_fsm_client.add_watcher(key.clone(), revision);
                     let state = self
                         .watched_keys
                         .insert(key, watch_id, Self::BROADCAST_CHANNEL_CAPACITY, value)
