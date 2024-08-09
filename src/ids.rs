@@ -24,9 +24,16 @@ impl std::fmt::Debug for LeaseId {
     }
 }
 
+impl std::fmt::Display for LeaseId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
 impl LeaseId {
     pub(crate) fn new(lease_id: i64) -> Option<LeaseId> {
-        NonZeroU64::new(lease_id as _).map(|l| Self(l))
+        let lease_id = lease_id.try_into().ok()?;
+        NonZeroU64::new(lease_id).map(|l| Self(l))
     }
 }
 
@@ -39,6 +46,10 @@ impl std::hash::Hash for LeaseId {
 impl LeaseId {
     pub fn get(&self) -> u64 {
         self.0.get()
+    }
+
+    pub(crate) fn get_i64(&self) -> i64 {
+        self.get() as _
     }
 }
 

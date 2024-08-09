@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    future::Future,
+    future::{pending, Future},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -9,37 +9,28 @@ use std::{
     time::Duration,
 };
 
+use futures::Stream;
 use tokio::{
     sync::{
-        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender, WeakUnboundedSender},
-        oneshot, Notify,
+        mpsc::{UnboundedReceiver, UnboundedSender},
+        Notify,
     },
     task::JoinSet,
-    time::{interval, sleep, timeout_at, Instant, Interval, Sleep},
+    time::{timeout_at, Instant, Sleep},
 };
 use tokio_etcd_grpc_client::{
     AuthedChannel, LeaseClient, LeaseGrantRequest, LeaseKeepAliveRequest, LeaseKeepAliveResponse,
     LeaseRevokeRequest,
 };
-use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tokio_timer::{delay_queue::Key, DelayQueue};
 use tonic::{Response, Status, Streaming};
+
+use crate::{ids::IdFastHasherBuilder, utils::backoff::ExponentialBackoff, LeaseId};
 
 struct LeaseRevokedNotify {
     notify: Notify,
     revoked: AtomicBool,
 }
-struct LeaseRevokedNotifyDropGuard {
-    notify: Arc<LeaseRevokedNotify>,
-}
-
-impl Drop for LeaseRevokedNotifyDropGuard {
-    fn drop(&mut self) {
-        self.notify.set_revoked();
-    }
-}
-
-impl LeaseRevokedNotifyDropGuard {}
 
 impl LeaseRevokedNotify {
     fn new() -> (Arc<Self>, LeaseRevokedNotifyDropGuard) {
@@ -61,23 +52,35 @@ impl LeaseRevokedNotify {
     }
 }
 
+/// Holds a [`LeaseRevokedNotify`] and sets it as revoked if for some reason this
+/// struct is dropped, which might imply that the message was dropped, or that
+/// the worker panicked.
+struct LeaseRevokedNotifyDropGuard {
+    notify: Arc<LeaseRevokedNotify>,
+}
+
+impl Drop for LeaseRevokedNotifyDropGuard {
+    fn drop(&mut self) {
+        self.notify.set_revoked();
+    }
+}
+
 struct LeaseHandleInner {
-    /// Notify is updated when lease_released is changed.
     worker_tx: UnboundedSender<LeaseWorkerMessage>,
-    lease_revoked_notify: Arc<LeaseRevokedNotify>,
-    id: i64,
+    notify: Arc<LeaseRevokedNotify>,
+    id: LeaseId,
 }
 
 impl LeaseHandleInner {
     fn new(
-        id: i64,
+        id: LeaseId,
         worker_tx: UnboundedSender<LeaseWorkerMessage>,
-        lease_revoked_notify: Arc<LeaseRevokedNotify>,
+        notify: Arc<LeaseRevokedNotify>,
     ) -> Self {
         Self {
             id,
             worker_tx,
-            lease_revoked_notify,
+            notify,
         }
     }
 }
@@ -103,15 +106,16 @@ pub struct LeaseHandle {
     inner: Arc<LeaseHandleInner>,
 }
 
+#[derive(Clone)]
 pub(crate) struct LeaseWorkerHandle {
     worker_tx: UnboundedSender<LeaseWorkerMessage>,
 }
 
 impl LeaseWorkerHandle {
-    fn manage_lease(self, lease_id: i64, expires_at: Instant) -> Arc<LeaseHandleInner> {
+    fn keep_alive_lease(self, lease_id: LeaseId, expires_at: Instant) -> Arc<LeaseHandleInner> {
         let (notify, drop_guard) = LeaseRevokedNotify::new();
         self.worker_tx
-            .send(LeaseWorkerMessage::ManageLease {
+            .send(LeaseWorkerMessage::KeepAliveLease {
                 lease_id,
                 drop_guard,
                 expires_at,
@@ -123,13 +127,13 @@ impl LeaseWorkerHandle {
 }
 
 pub enum LeaseWorkerMessage {
-    ManageLease {
-        lease_id: i64,
+    KeepAliveLease {
+        lease_id: LeaseId,
         drop_guard: LeaseRevokedNotifyDropGuard,
         expires_at: Instant,
     },
     RevokeLease {
-        lease_id: i64,
+        lease_id: LeaseId,
     },
 }
 
@@ -151,30 +155,28 @@ impl LeaseHandle {
             .await?
             .into_inner();
 
-        let inner = worker_handle.manage_lease(
-            lease.id,
+        let lease_id = LeaseId::new(lease.id).expect("invariant: lease id was valid");
+        let inner = worker_handle.keep_alive_lease(
+            lease_id,
             Instant::now() + Duration::from_secs(lease.ttl as _),
         );
         Ok(LeaseHandle { inner })
     }
 
     /// Returns the lease id, or None if the lease has expired.
-    pub fn lease_id(&self) -> Option<i64> {
-        self.inner
-            .lease_revoked_notify
-            .is_revoked()
-            .then_some(self.inner.id)
+    pub fn lease_id(&self) -> Option<LeaseId> {
+        self.inner.notify.is_revoked().then_some(self.inner.id)
     }
 
-    /// Monitors the lease, resolving if the lease for whatever reason was revoked or expired by the server
+    /// Monitors the lease, returning if the lease for whatever reason was revoked or expired by the server
     /// (and thus should not be used anymore).
     pub async fn monitor(&self) {
         loop {
-            if self.inner.lease_revoked_notify.is_revoked() {
+            if self.inner.notify.is_revoked() {
                 break;
             }
 
-            self.inner.lease_revoked_notify.notify.notified().await;
+            self.inner.notify.notify.notified().await;
         }
     }
 }
@@ -200,14 +202,67 @@ enum LeaseStreamState {
 struct LeaseStream {
     state: LeaseStreamState,
     lease_client: LeaseClient<AuthedChannel>,
-    leases: HashMap<i64, LeaseState>, // fixme: use fast hasher.
-    dq: DelayQueue<i64>,
+    leases: HashMap<LeaseId, LeaseState, IdFastHasherBuilder>,
+    dq: DelayQueue<LeaseId>,
+}
+
+impl LeaseStream {
+    fn keep_alive_lease(
+        &mut self,
+        lease_id: LeaseId,
+        drop_guard: LeaseRevokedNotifyDropGuard,
+        expires_at: Instant,
+    ) {
+        let key = self
+            .dq
+            .insert(lease_id, calculate_keepalive_at(expires_at, Instant::now()));
+        let state = LeaseState {
+            key: Some(key),
+            expires_at,
+            drop_guard,
+        };
+        self.leases
+            .insert(lease_id, state)
+            .expect("invariant: should not have recycled lease id");
+    }
+
+    fn cancel_keep_alive(
+        &mut self,
+        lease_id: LeaseId,
+    ) -> Option<(Instant, LeaseRevokedNotifyDropGuard)> {
+        let state = self.leases.remove(&lease_id)?;
+        if let Some(key) = state.key {
+            self.dq.remove(&key);
+        }
+
+        Some((state.expires_at, state.drop_guard))
+    }
+
+    fn cancel_all_keepalives(&mut self) -> Vec<(LeaseId, Instant, LeaseRevokedNotifyDropGuard)> {
+        let mut lease_infos = Vec::with_capacity(self.leases.len());
+        for (lease_id, state) in self.leases.drain() {
+            if let Some(key) = state.key {
+                self.dq.remove(&key);
+            }
+            lease_infos.push((lease_id, state.expires_at, state.drop_guard));
+        }
+
+        lease_infos
+    }
+
+    // async fn poll_lease(&mut self) -> LeaseId {
+    //     if self.dq.is_empty() {
+    //         pending().await;
+    //     }
+
+    //     let n = self.dq.next();
+    // }
 }
 
 struct LeaseState {
     expires_at: Instant,
-    notify_drop_guard: LeaseRevokedNotifyDropGuard,
-    key: Key,
+    drop_guard: LeaseRevokedNotifyDropGuard,
+    key: Option<Key>,
 }
 
 struct LeaseWorker {
@@ -239,7 +294,10 @@ impl LeaseWorker {
                     self.handle_worker_message(worker_message);
                 }
                 Action::WorkerMessage(None) => {
-                    self.revoke_all_leases();
+                    let infos = self.stream.cancel_all_keepalives();
+                    for (lease_id, expires_at, drop_guard) in infos {
+                        self.spawn_revoke_lease(lease_id, expires_at, drop_guard);
+                    }
                     self.drain_revoke_requests().await;
                     break;
                 }
@@ -247,19 +305,68 @@ impl LeaseWorker {
         }
     }
 
-    fn handle_worker_message(&self, worker_message: LeaseWorkerMessage) {
-        todo!()
-    }
-
-    fn revoke_all_leases(&mut self) {
-        let mut leases_to_revoke = Vec::with_capacity(self.stream.leases.len());
-        for (lease_id, lease_state) in self.stream.leases.drain() {
-            self.stream.dq.remove(&lease_state.key);
-            leases_to_revoke.push(lease_id);
+    fn handle_worker_message(&mut self, worker_message: LeaseWorkerMessage) {
+        match worker_message {
+            LeaseWorkerMessage::KeepAliveLease {
+                lease_id,
+                drop_guard,
+                expires_at,
+            } => self
+                .stream
+                .keep_alive_lease(lease_id, drop_guard, expires_at),
+            LeaseWorkerMessage::RevokeLease { lease_id } => {
+                if let Some((expires_at, drop_guard)) = self.stream.cancel_keep_alive(lease_id) {
+                    self.spawn_revoke_lease(lease_id, expires_at, drop_guard);
+                }
+            }
         }
     }
 
-    fn spawn_revoke_lease(&self, lease_id: i64) {}
+    fn spawn_revoke_lease(
+        &mut self,
+        lease_id: LeaseId,
+        expires_at: Instant,
+        drop_guard: LeaseRevokedNotifyDropGuard,
+    ) {
+        let mut lease_client = self.stream.lease_client.clone();
+        self.revoke_join_set.spawn(async move {
+            let revoke_future = async {
+                let mut backoff =
+                    ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(5));
+                loop {
+                    match lease_client
+                        .lease_revoke(LeaseRevokeRequest {
+                            id: lease_id.get_i64(),
+                        })
+                        .await
+                    {
+                        Ok(res) => {
+                            break res;
+                        }
+                        Err(_) => {
+                            backoff.delay().await;
+                        }
+                    }
+                }
+            };
+
+            match timeout_at(expires_at, revoke_future).await {
+                Ok(_) => {
+                    tracing::warn!("revoked lease {} successfully.", lease_id);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "timed out trying to issue revoke lease {} call before the lease expired.",
+                        lease_id
+                    );
+                }
+            }
+
+            // Retain the drop guard till it's explicitly dropped here, to notify when we're sure
+            // the lease is revoked.
+            drop(drop_guard);
+        });
+    }
 
     // async fn run(mut self) {
     //     loop {
@@ -372,37 +479,10 @@ impl LeaseWorker {
     //         }
     //     }
     // }
+}
 
-    // async fn revoke_lease(mut self) {
-    //     let revoke_future = async {
-    //         loop {
-    //             match self
-    //                 .lease_client
-    //                 .lease_revoke(LeaseRevokeRequest {
-    //                     id: self.handle_inner.id,
-    //                 })
-    //                 .await
-    //             {
-    //                 Ok(res) => {
-    //                     break res;
-    //                 }
-    //                 Err(_) => {
-    //                     sleep(Duration::from_secs(1)).await;
-    //                 }
-    //             }
-    //         }
-    //     };
-
-    //     match timeout_at(self.timeout_at, revoke_future).await {
-    //         Ok(_) => {
-    //             tracing::warn!("revoked lease {} successfully.", self.handle_inner.id);
-    //         }
-    //         Err(_) => {
-    //             tracing::warn!(
-    //                 "timed out trying to issue revoke lease {} call before the lease expired.",
-    //                 self.handle_inner.id
-    //             );
-    //         }
-    //     }
-    // }
+fn calculate_keepalive_at(expires_at: Instant, now: Instant) -> Duration {
+    let duration_until_expiry = expires_at.saturating_duration_since(now);
+    let sixty_six_percent_duration = duration_until_expiry / 3 * 2;
+    sixty_six_percent_duration
 }

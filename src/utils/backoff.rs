@@ -1,5 +1,6 @@
 use rand::Rng;
 use std::time::Duration;
+use tokio::time::sleep;
 
 pub(crate) struct ExponentialBackoff {
     min: Duration,
@@ -25,6 +26,10 @@ impl ExponentialBackoff {
         let duration = self.current.mul_f64(2.0 + jitter);
         self.current = duration.min(self.max);
         self.current
+    }
+
+    pub async fn delay(&mut self) {
+        sleep(self.fail()).await;
     }
 
     /// Resets the current backoff duration to the minimum duration, indicating that the operation was successful.

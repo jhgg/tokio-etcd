@@ -68,7 +68,8 @@ impl Client {
     ///
     /// `ttl` must be above 10 seconds.
     pub async fn grant_lease(&self, ttl: Duration) -> Result<LeaseHandle, Status> {
-        LeaseHandle::grant(self.grpc_client.lease(), ttl).await
+        // LeaseHandle::grant(self.grpc_client.lease(), ttl).await
+        todo!()
     }
 }
 
