@@ -9,13 +9,13 @@ http = "1.1.0"
 thiserror = "1.0.63"
 tokio = "1.38.0"
 tokio-stream = { version = "0.1.15", features = ["sync"] }
-tokio-timer = "0.2.13"
 tonic = "0.12.1"
 tracing = { version = "0.1.40", features = ["log"] }
 
 tokio-etcd-grpc-client = { path = "./grpc-client" }
 rand = "0.8.5"
-futures = "0.1.29"
+tokio-util = { version = "0.7.11", features = ["time"] }
+futures = "0.3"
 
 [dev-dependencies]
 expect-test = "1.5.0"

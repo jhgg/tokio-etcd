@@ -9,20 +9,21 @@ use std::{
     time::Duration,
 };
 
-use futures::Stream;
+use futures::FutureExt;
 use tokio::{
     sync::{
-        mpsc::{UnboundedReceiver, UnboundedSender},
+        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
         Notify,
     },
     task::JoinSet,
-    time::{timeout_at, Instant, Sleep},
+    time::{sleep, timeout_at, Instant, Sleep},
 };
 use tokio_etcd_grpc_client::{
     AuthedChannel, LeaseClient, LeaseGrantRequest, LeaseKeepAliveRequest, LeaseKeepAliveResponse,
     LeaseRevokeRequest,
 };
-use tokio_timer::{delay_queue::Key, DelayQueue};
+use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
+use tokio_util::time::{delay_queue::Key, DelayQueue};
 use tonic::{Response, Status, Streaming};
 
 use crate::{ids::IdFastHasherBuilder, utils::backoff::ExponentialBackoff, LeaseId};
@@ -88,7 +89,7 @@ impl LeaseHandleInner {
 impl Drop for LeaseHandleInner {
     fn drop(&mut self) {
         self.worker_tx
-            .send(LeaseWorkerMessage::RevokeLease { lease_id: self.id })
+            .send(LeaseWorkerMessage::RevokeLease { id: self.id })
             .ok();
     }
 }
@@ -112,28 +113,28 @@ pub(crate) struct LeaseWorkerHandle {
 }
 
 impl LeaseWorkerHandle {
-    fn keep_alive_lease(self, lease_id: LeaseId, expires_at: Instant) -> Arc<LeaseHandleInner> {
+    fn keep_alive_lease(self, id: LeaseId, expires_at: Instant) -> Arc<LeaseHandleInner> {
         let (notify, drop_guard) = LeaseRevokedNotify::new();
         self.worker_tx
             .send(LeaseWorkerMessage::KeepAliveLease {
-                lease_id,
+                id,
                 drop_guard,
                 expires_at,
             })
             .ok();
 
-        Arc::new(LeaseHandleInner::new(lease_id, self.worker_tx, notify))
+        Arc::new(LeaseHandleInner::new(id, self.worker_tx, notify))
     }
 }
 
 pub enum LeaseWorkerMessage {
     KeepAliveLease {
-        lease_id: LeaseId,
+        id: LeaseId,
         drop_guard: LeaseRevokedNotifyDropGuard,
         expires_at: Instant,
     },
     RevokeLease {
-        lease_id: LeaseId,
+        id: LeaseId,
     },
 }
 
@@ -155,16 +156,14 @@ impl LeaseHandle {
             .await?
             .into_inner();
 
-        let lease_id = LeaseId::new(lease.id).expect("invariant: lease id was valid");
-        let inner = worker_handle.keep_alive_lease(
-            lease_id,
-            Instant::now() + Duration::from_secs(lease.ttl as _),
-        );
+        let id = LeaseId::new(lease.id).expect("invariant: lease id was valid");
+        let inner = worker_handle
+            .keep_alive_lease(id, Instant::now() + Duration::from_secs(lease.ttl as _));
         Ok(LeaseHandle { inner })
     }
 
     /// Returns the lease id, or None if the lease has expired.
-    pub fn lease_id(&self) -> Option<LeaseId> {
+    pub fn id(&self) -> Option<LeaseId> {
         self.inner.notify.is_revoked().then_some(self.inner.id)
     }
 
@@ -186,12 +185,10 @@ type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 enum LeaseStreamState {
     Disconnected,
-    Connecting(
-        BoxFuture<(
-            Result<Response<Streaming<LeaseKeepAliveRequest>>, Status>,
-            UnboundedSender<LeaseKeepAliveRequest>,
-        )>,
-    ),
+    Connecting {
+        connecting: BoxFuture<Result<Response<Streaming<LeaseKeepAliveResponse>>, Status>>,
+        out: UnboundedSender<LeaseKeepAliveRequest>,
+    },
     Reconnecting(Pin<Box<Sleep>>),
     Connected {
         stream: Streaming<LeaseKeepAliveResponse>,
@@ -199,38 +196,115 @@ enum LeaseStreamState {
     },
 }
 
-struct LeaseStream {
+struct LeaseStreamX {
     state: LeaseStreamState,
     lease_client: LeaseClient<AuthedChannel>,
+    backoff: ExponentialBackoff,
+}
+enum LeaseStreamMessage {
+    Connecting,
+    Response(LeaseKeepAliveResponse),
+}
+
+impl LeaseStreamX {
+    fn can_send(&self) -> bool {
+        matches!(
+            self.state,
+            LeaseStreamState::Connected { .. } | LeaseStreamState::Reconnecting { .. }
+        )
+    }
+
+    fn send_keep_alive(&mut self, id: LeaseId) -> bool {
+        match &mut self.state {
+            LeaseStreamState::Connecting { out, .. } | LeaseStreamState::Connected { out, .. } => {
+                out.send(LeaseKeepAliveRequest { id: id.get_i64() }).is_ok()
+            }
+            _ => false,
+        }
+    }
+
+    async fn next_message(&mut self) -> LeaseStreamMessage {
+        loop {
+            match &mut self.state {
+                LeaseStreamState::Disconnected => pending().await,
+                LeaseStreamState::Connecting { connecting, out } => match connecting.await {
+                    Ok(streaming) => {
+                        self.backoff.succeed();
+                        self.state = LeaseStreamState::Connected {
+                            stream: streaming.into_inner(),
+                            out: out.clone(),
+                        };
+                    }
+                    Err(status) => {
+                        let delay = self.backoff.fail();
+                        tracing::error!(
+                            "failed to connect to lease keep-alive channel, error: {:?}, will reconnect in {:?}",
+                            status,
+                            delay
+                        );
+                        self.state = LeaseStreamState::Reconnecting(Box::pin(sleep(delay)));
+                    }
+                },
+                LeaseStreamState::Reconnecting(sleep) => {
+                    sleep.await;
+                    let (tx, rx) = unbounded_channel();
+                    let mut lease_client = self.lease_client.clone();
+                    self.state = LeaseStreamState::Connecting {
+                        out: tx,
+                        connecting: Box::pin(async move {
+                            lease_client
+                                .lease_keep_alive(UnboundedReceiverStream::new(rx))
+                                .await
+                        }),
+                    };
+                    return LeaseStreamMessage::Connecting;
+                }
+                LeaseStreamState::Connected { stream, .. } => match stream.next().await {
+                    Some(Ok(r)) => {
+                        return LeaseStreamMessage::Response(r);
+                    }
+                    Some(Err(status)) => {
+                        tracing::error!(
+                            "received error from lease keep-alive stream: {:?}",
+                            status
+                        );
+                    }
+                    None => {
+                        self.state = LeaseStreamState::Disconnected;
+                    }
+                },
+            }
+        }
+    }
+}
+
+struct LeaseMap {
     leases: HashMap<LeaseId, LeaseState, IdFastHasherBuilder>,
     dq: DelayQueue<LeaseId>,
 }
 
-impl LeaseStream {
+impl LeaseMap {
     fn keep_alive_lease(
         &mut self,
-        lease_id: LeaseId,
+        id: LeaseId,
         drop_guard: LeaseRevokedNotifyDropGuard,
         expires_at: Instant,
     ) {
         let key = self
             .dq
-            .insert(lease_id, calculate_keepalive_at(expires_at, Instant::now()));
+            .insert(id, calculate_keepalive_at(expires_at, Instant::now()));
         let state = LeaseState {
             key: Some(key),
             expires_at,
             drop_guard,
         };
         self.leases
-            .insert(lease_id, state)
+            .insert(id, state)
             .expect("invariant: should not have recycled lease id");
     }
 
-    fn cancel_keep_alive(
-        &mut self,
-        lease_id: LeaseId,
-    ) -> Option<(Instant, LeaseRevokedNotifyDropGuard)> {
-        let state = self.leases.remove(&lease_id)?;
+    fn cancel_keep_alive(&mut self, id: LeaseId) -> Option<(Instant, LeaseRevokedNotifyDropGuard)> {
+        let state = self.leases.remove(&id)?;
         if let Some(key) = state.key {
             self.dq.remove(&key);
         }
@@ -238,25 +312,61 @@ impl LeaseStream {
         Some((state.expires_at, state.drop_guard))
     }
 
-    fn cancel_all_keepalives(&mut self) -> Vec<(LeaseId, Instant, LeaseRevokedNotifyDropGuard)> {
+    fn cancel_all_keep_alives(&mut self) -> Vec<(LeaseId, Instant, LeaseRevokedNotifyDropGuard)> {
         let mut lease_infos = Vec::with_capacity(self.leases.len());
-        for (lease_id, state) in self.leases.drain() {
+        for (id, state) in self.leases.drain() {
             if let Some(key) = state.key {
                 self.dq.remove(&key);
             }
-            lease_infos.push((lease_id, state.expires_at, state.drop_guard));
+            lease_infos.push((id, state.expires_at, state.drop_guard));
         }
 
         lease_infos
     }
 
-    // async fn poll_lease(&mut self) -> LeaseId {
-    //     if self.dq.is_empty() {
-    //         pending().await;
-    //     }
+    /// Leases that are currently being renewed will have a `None` key. If we've reconnected, we need to
+    /// re-schedule all the keep-alives that were sent but have not yet been acknowledged.
+    fn ensure_all_keep_alives_scheduled(&mut self) {
+        let now = Instant::now();
+        for (id, state) in &mut self.leases {
+            if state.key.is_none() {
+                state.key = Some(
+                    self.dq
+                        .insert(*id, calculate_keepalive_at(state.expires_at, now)),
+                );
+            }
+        }
+    }
 
-    //     let n = self.dq.next();
-    // }
+    async fn next_lease_to_keep_alive(&mut self) -> LeaseId {
+        match self.dq.next().await {
+            Some(expired) => {
+                let id = expired.into_inner();
+                let lease_state = self
+                    .leases
+                    .get_mut(&id)
+                    .expect("invariant: lease should exist");
+
+                lease_state.key = None;
+                id
+            }
+            None => pending().await,
+        }
+    }
+
+    fn update_lease(&mut self, id: LeaseId, expires_at: Instant) -> Option<()> {
+        let lease_state = self.leases.get_mut(&id)?;
+        if let Some(key) = &lease_state.key {
+            self.dq.remove(key);
+        }
+
+        lease_state.expires_at = expires_at;
+        lease_state.key = Some(
+            self.dq
+                .insert(id, calculate_keepalive_at(expires_at, Instant::now())),
+        );
+        Some(())
+    }
 }
 
 struct LeaseState {
@@ -268,7 +378,8 @@ struct LeaseState {
 struct LeaseWorker {
     rx: UnboundedReceiver<LeaseWorkerMessage>,
     revoke_join_set: JoinSet<()>,
-    stream: LeaseStream,
+    map: LeaseMap,
+    stream: LeaseStreamX,
 }
 
 impl LeaseWorker {
@@ -282,11 +393,17 @@ impl LeaseWorker {
         loop {
             enum Action {
                 WorkerMessage(Option<LeaseWorkerMessage>),
+                SendLeaseKeepAlive(LeaseId),
+                LeaseStreamMessage(LeaseStreamMessage),
             }
 
             let action = tokio::select! {
                 message = self.rx.recv() => Action::WorkerMessage(message),
                 _ = self.revoke_join_set.join_next(), if !self.revoke_join_set.is_empty() => continue,
+                lease_id = self.map.next_lease_to_keep_alive(), if self.stream.can_send() => {
+                    Action::SendLeaseKeepAlive(lease_id)
+                }
+                message = self.stream.next_message() => Action::LeaseStreamMessage(message),
             };
 
             match action {
@@ -294,12 +411,18 @@ impl LeaseWorker {
                     self.handle_worker_message(worker_message);
                 }
                 Action::WorkerMessage(None) => {
-                    let infos = self.stream.cancel_all_keepalives();
-                    for (lease_id, expires_at, drop_guard) in infos {
-                        self.spawn_revoke_lease(lease_id, expires_at, drop_guard);
+                    let infos = self.map.cancel_all_keep_alives();
+                    for (id, expires_at, drop_guard) in infos {
+                        self.spawn_revoke_lease(id, expires_at, drop_guard);
                     }
                     self.drain_revoke_requests().await;
                     break;
+                }
+                Action::LeaseStreamMessage(message) => {
+                    self.handle_lease_stream_message(message);
+                }
+                Action::SendLeaseKeepAlive(id) => {
+                    self.stream.send_keep_alive(id);
                 }
             }
         }
@@ -308,15 +431,13 @@ impl LeaseWorker {
     fn handle_worker_message(&mut self, worker_message: LeaseWorkerMessage) {
         match worker_message {
             LeaseWorkerMessage::KeepAliveLease {
-                lease_id,
+                id,
                 drop_guard,
                 expires_at,
-            } => self
-                .stream
-                .keep_alive_lease(lease_id, drop_guard, expires_at),
-            LeaseWorkerMessage::RevokeLease { lease_id } => {
-                if let Some((expires_at, drop_guard)) = self.stream.cancel_keep_alive(lease_id) {
-                    self.spawn_revoke_lease(lease_id, expires_at, drop_guard);
+            } => self.map.keep_alive_lease(id, drop_guard, expires_at),
+            LeaseWorkerMessage::RevokeLease { id } => {
+                if let Some((expires_at, drop_guard)) = self.map.cancel_keep_alive(id) {
+                    self.spawn_revoke_lease(id, expires_at, drop_guard);
                 }
             }
         }
@@ -324,7 +445,7 @@ impl LeaseWorker {
 
     fn spawn_revoke_lease(
         &mut self,
-        lease_id: LeaseId,
+        id: LeaseId,
         expires_at: Instant,
         drop_guard: LeaseRevokedNotifyDropGuard,
     ) {
@@ -335,9 +456,7 @@ impl LeaseWorker {
                     ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(5));
                 loop {
                     match lease_client
-                        .lease_revoke(LeaseRevokeRequest {
-                            id: lease_id.get_i64(),
-                        })
+                        .lease_revoke(LeaseRevokeRequest { id: id.get_i64() })
                         .await
                     {
                         Ok(res) => {
@@ -352,12 +471,12 @@ impl LeaseWorker {
 
             match timeout_at(expires_at, revoke_future).await {
                 Ok(_) => {
-                    tracing::warn!("revoked lease {} successfully.", lease_id);
+                    tracing::warn!("revoked lease {} successfully.", id);
                 }
                 Err(_) => {
                     tracing::warn!(
                         "timed out trying to issue revoke lease {} call before the lease expired.",
-                        lease_id
+                        id
                     );
                 }
             }
@@ -368,117 +487,27 @@ impl LeaseWorker {
         });
     }
 
-    // async fn run(mut self) {
-    //     loop {
-    //         match &mut self.state {
-    //             LeaseStreamState::Disconnected => {
-    //                 let (tx, rx) = unbounded_channel();
-    //                 tx.send(LeaseKeepAliveRequest {
-    //                     id: self.handle_inner.id,
-    //                 })
-    //                 .ok();
-
-    //                 let keep_alive_result = tokio::select! {
-    //                     res = self.lease_client.lease_keep_alive(UnboundedReceiverStream::new(rx)) => res,
-    //                     _ = &mut self.dropped_receiver => {
-    //                         self.revoke_lease().await;
-    //                         break;
-    //                     }
-    //                 };
-    //                 match keep_alive_result {
-    //                     Ok(response) => {
-    //                         self.state = LeaseStreamState::HasStream {
-    //                             stream: response.into_inner(),
-    //                             out: tx,
-    //                         };
-    //                     }
-    //                     Err(error) => {
-    //                         tracing::error!(
-    //                             "error establishing lease channel for lease: {}, error: {:?}",
-    //                             self.handle_inner.id,
-    //                             error
-    //                         );
-    //                         sleep(Duration::from_secs(3)).await;
-    //                     }
-    //                 }
-    //             }
-    //             LeaseStreamState::HasStream { stream, out } => {
-    //                 enum Action {
-    //                     /// All copies of the handle have dropped, so we can go ahead and revoke the lease.
-    //                     HandleDropped,
-    //                     /// Lease renewal interval has elapsed, so we should send a lease keep alive.
-    //                     RequestKeepAlive,
-    //                     /// We got a keep-alive response from the server.
-    //                     KeepAliveResponse(Option<Result<LeaseKeepAliveResponse, Status>>),
-    //                 }
-
-    //                 let action = tokio::select! {
-    //                     _ = self.interval.tick() => Action::RequestKeepAlive,
-    //                     _ = &mut self.dropped_receiver => Action::HandleDropped,
-    //                     res = stream.next() => Action::KeepAliveResponse(res),
-    //                 };
-
-    //                 match action {
-    //                     Action::HandleDropped => {
-    //                         self.revoke_lease().await;
-    //                         break;
-    //                     }
-    //                     Action::RequestKeepAlive => {
-    //                         out.send(LeaseKeepAliveRequest {
-    //                             id: self.handle_inner.id,
-    //                         })
-    //                         .ok();
-    //                     }
-    //                     Action::KeepAliveResponse(None) => {
-    //                         tracing::info!(
-    //                             "lease {} keep-alive channel closed, re-establishing",
-    //                             self.handle_inner.id
-    //                         );
-    //                         self.state = LeaseStreamState::Disconnected;
-    //                     }
-    //                     Action::KeepAliveResponse(Some(Err(status))) => {
-    //                         tracing::error!(
-    //                             "error renewing lease {}, keep-alive channel returned error: {:?}, will retry",
-    //                             self.handle_inner.id,
-    //                             status
-    //                         );
-    //                         self.interval.reset_after(Duration::from_secs(1));
-    //                     }
-    //                     Action::KeepAliveResponse(Some(Ok(response))) => {
-    //                         assert_eq!(
-    //                             response.id, self.handle_inner.id,
-    //                             "bug: lease id does not match"
-    //                         );
-
-    //                         if response.ttl > 0 {
-    //                             tracing::info!(
-    //                                 "lease {} has been kept-alive, new TTL: {}",
-    //                                 self.handle_inner.id,
-    //                                 response.ttl
-    //                             );
-    //                             self.interval.reset_after(Duration::from_millis(
-    //                                 (((response.ttl * 1000) as f32) * 0.5) as _,
-    //                             ));
-    //                             self.timeout_at =
-    //                                 Instant::now() + Duration::from_secs(response.ttl as _);
-    //                         } else {
-    //                             tracing::error!(
-    //                                 "lease {} has expired before we could keep it alive",
-    //                                 self.handle_inner.id
-    //                             );
-    //                             self.state = LeaseStreamState::Revoked;
-    //                             break;
-    //                         }
-    //                     }
-    //                 }
-    //             }
-    //             LeaseStreamState::Revoked => {
-    //                 self.handle_inner.set_revoked();
-    //                 break;
-    //             }
-    //         }
-    //     }
-    // }
+    fn handle_lease_stream_message(&mut self, message: LeaseStreamMessage) {
+        match message {
+            LeaseStreamMessage::Connecting => {
+                // Re-schedule and send all in-flight keep-alive messages.
+                self.map.ensure_all_keep_alives_scheduled();
+                while let Some(id) = self.map.next_lease_to_keep_alive().now_or_never() {
+                    self.stream.send_keep_alive(id);
+                }
+            }
+            LeaseStreamMessage::Response(response) => {
+                let id = LeaseId::new(response.id)
+                    .expect("invariant: server sent back invalid lease id");
+                if response.ttl <= 0 {
+                    self.map.cancel_keep_alive(id);
+                } else {
+                    let expires_at = Instant::now() + Duration::from_secs(response.ttl as _);
+                    self.map.update_lease(id, expires_at);
+                }
+            }
+        }
+    }
 }
 
 fn calculate_keepalive_at(expires_at: Instant, now: Instant) -> Duration {
