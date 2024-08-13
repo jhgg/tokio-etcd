@@ -56,7 +56,7 @@ impl LeaseRevokedNotify {
 /// Holds a [`LeaseRevokedNotify`] and sets it as revoked if for some reason this
 /// struct is dropped, which might imply that the message was dropped, or that
 /// the worker panicked.
-struct LeaseRevokedNotifyDropGuard {
+pub(crate) struct LeaseRevokedNotifyDropGuard {
     notify: Arc<LeaseRevokedNotify>,
 }
 
@@ -109,13 +109,13 @@ pub struct LeaseHandle {
 
 #[derive(Clone)]
 pub(crate) struct LeaseWorkerHandle {
-    worker_tx: UnboundedSender<LeaseWorkerMessage>,
+    sender: UnboundedSender<LeaseWorkerMessage>,
 }
 
 impl LeaseWorkerHandle {
     fn keep_alive_lease(self, id: LeaseId, expires_at: Instant) -> Arc<LeaseHandleInner> {
         let (notify, drop_guard) = LeaseRevokedNotify::new();
-        self.worker_tx
+        self.sender
             .send(LeaseWorkerMessage::KeepAliveLease {
                 id,
                 drop_guard,
@@ -123,7 +123,19 @@ impl LeaseWorkerHandle {
             })
             .ok();
 
-        Arc::new(LeaseHandleInner::new(id, self.worker_tx, notify))
+        Arc::new(LeaseHandleInner::new(id, self.sender, notify))
+    }
+
+    pub(crate) fn spawn(lease_client: LeaseClient<AuthedChannel>) -> Self {
+        todo!();
+    }
+
+    pub(crate) fn from_sender(sender: UnboundedSender<LeaseWorkerMessage>) -> Self {
+        Self { sender }
+    }
+
+    pub(crate) fn into_inner(self) -> UnboundedSender<LeaseWorkerMessage> {
+        self.sender
     }
 }
 

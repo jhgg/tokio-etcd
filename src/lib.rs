@@ -10,7 +10,7 @@ mod utils;
 pub mod watcher;
 
 pub use ids::{LeaseId, WatchId};
-use lease::LeaseHandle;
+use lease::{LeaseHandle, LeaseWorkerHandle, LeaseWorkerMessage};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, WeakUnboundedSender};
 pub use tokio_etcd_grpc_client::ClientEndpointConfig;
 use tokio_etcd_grpc_client::EtcdGrpcClient;
@@ -18,6 +18,7 @@ use tokio_etcd_grpc_client::EtcdGrpcClient;
 pub struct Client {
     grpc_client: EtcdGrpcClient,
     watcher_singleton: WeakSingleton<watcher::WatcherHandle>,
+    lease_worker_singleton: WeakUnboundedSenderSingleton<LeaseWorkerMessage>,
 }
 
 impl Client {
@@ -29,6 +30,7 @@ impl Client {
         Self {
             grpc_client,
             watcher_singleton: WeakSingleton::new(),
+            lease_worker_singleton: WeakUnboundedSenderSingleton::new(),
         }
     }
 
@@ -68,8 +70,17 @@ impl Client {
     ///
     /// `ttl` must be above 10 seconds.
     pub async fn grant_lease(&self, ttl: Duration) -> Result<LeaseHandle, Status> {
-        // LeaseHandle::grant(self.grpc_client.lease(), ttl).await
-        todo!()
+        let sender = self.lease_worker_singleton.get_or_init(|| {
+            let handle = LeaseWorkerHandle::spawn(self.grpc_client.lease());
+            handle.into_inner()
+        });
+
+        LeaseHandle::grant(
+            self.grpc_client.lease(),
+            LeaseWorkerHandle::from_sender(sender),
+            ttl,
+        )
+        .await
     }
 }
 
