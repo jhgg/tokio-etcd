@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use futures::{channel::mpsc::unbounded, FutureExt};
+use futures::FutureExt;
 use tokio::{
     sync::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},

@@ -62,50 +62,80 @@ pub struct ClientEndpointConfig {
     schema: EndpointSchema,
     port: EndpointPort,
     token: Option<HeaderValue>,
-    // todo: pick better defaults
-    request_timeout: Option<Duration>,
-    connect_timeout: Option<Duration>,
-    tcp_keepalive: Option<Duration>,
+    request_timeout: Duration,
+    connect_timeout: Duration,
+    tcp_keep_alive: Option<Duration>,
+    http2_keep_alive_interval: Duration,
+    http2_keep_alive_timeout: Duration,
+    http2_keep_alive_while_idle: bool,
 }
 
 impl ClientEndpointConfig {
+    const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+    const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+    const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+    const DEFAULT_HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(15);
+
     pub fn http() -> Self {
         Self {
             schema: EndpointSchema::Http,
+            connect_timeout: Self::DEFAULT_CONNECT_TIMEOUT,
+            request_timeout: Self::DEFAULT_REQUEST_TIMEOUT,
+            http2_keep_alive_interval: Self::DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL,
+            http2_keep_alive_timeout: Self::DEFAULT_HTTP2_KEEP_ALIVE_TIMEOUT,
             ..Default::default()
         }
     }
 
-    pub fn with_auth_token(mut self, token: HeaderValue) -> Self {
+    pub fn auth_token(mut self, token: HeaderValue) -> Self {
         self.token = Some(token);
         self
     }
 
-    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = Some(timeout);
+    /// Default: 5s.
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
-    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = Some(timeout);
+    /// Default: 3s.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 
-    pub fn with_tcp_keepalive(mut self, timeout: Duration) -> Self {
-        self.tcp_keepalive = Some(timeout);
+    /// Default: None.
+    pub fn tcp_keep_alive(mut self, timeout: Duration) -> Self {
+        self.tcp_keep_alive = Some(timeout);
         self
     }
 
-    fn configure(&self, mut endpoint: Endpoint) -> Endpoint {
-        if let Some(request_timeout) = self.request_timeout {
-            endpoint = endpoint.timeout(request_timeout);
-        }
-        if let Some(connect_timeout) = self.connect_timeout {
-            endpoint = endpoint.connect_timeout(connect_timeout);
-        }
-        endpoint = endpoint.tcp_keepalive(self.tcp_keepalive);
+    /// Default: 30s
+    pub fn http2_keep_alive_interval(mut self, interval: Duration) -> Self {
+        self.http2_keep_alive_interval = interval;
+        self
+    }
 
+    /// Defualt: 15s
+    pub fn http2_keep_alive_timeout(mut self, timeout: Duration) -> Self {
+        self.http2_keep_alive_timeout = timeout;
+        self
+    }
+
+    fn configure(&self, endpoint: Endpoint) -> Endpoint {
         endpoint
+            .timeout(self.request_timeout)
+            .connect_timeout(self.connect_timeout)
+            .tcp_keepalive(self.tcp_keep_alive)
+            .http2_keep_alive_interval(self.http2_keep_alive_interval)
+            .keep_alive_while_idle(self.http2_keep_alive_while_idle)
+            .keep_alive_timeout(self.http2_keep_alive_timeout)
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .expect("invariant: user-agent should always be valid")
     }
 
     fn port(&self) -> u16 {
