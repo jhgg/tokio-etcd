@@ -2,12 +2,9 @@ use std::{future::pending, pin::Pin, time::Duration};
 
 use tokio::{
     sync::mpsc::{unbounded_channel, UnboundedSender},
-    time::{Interval, Sleep},
+    time::Sleep,
 };
-use tokio_etcd_grpc_client::{
-    watch_request, AuthedChannel, WatchClient, WatchProgressRequest, WatchRequest, WatchResponse,
-    PROGRESS_WATCH_ID,
-};
+use tokio_etcd_grpc_client::{AuthedChannel, WatchClient, WatchRequest, WatchResponse};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Response, Status, Streaming};
 
@@ -22,23 +19,17 @@ pub(crate) struct WatcherFsmClient {
     watch_client: WatchClient<AuthedChannel>,
     connection_state: ConnectionState,
     watcher_fsm: WatcherFsm,
-    progress_request_interval: Duration,
     connection_incarnation: u64,
     backoff: ExponentialBackoff,
 }
 
 impl WatcherFsmClient {
-    pub fn new(
-        watch_client: WatchClient<AuthedChannel>,
-        progress_request_interval: Duration,
-        concurrent_sync_limit: usize,
-    ) -> Self {
+    pub fn new(watch_client: WatchClient<AuthedChannel>, concurrent_sync_limit: usize) -> Self {
         Self {
             watch_client,
             watcher_fsm: WatcherFsm::new(concurrent_sync_limit),
             connection_state: ConnectionState::Disconnected,
             connection_incarnation: 0,
-            progress_request_interval,
             backoff: ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(10)),
         }
     }
@@ -76,11 +67,7 @@ impl WatcherFsmClient {
                 // We're connecting to the etcd server.
                 ConnectionState::Connecting(connecting) => match connecting.await {
                     (Ok(response), sender) => {
-                        let connected = ConnectedWatcherStream::new(
-                            response.into_inner(),
-                            self.progress_request_interval,
-                            sender,
-                        );
+                        let connected = ConnectedWatcherStream::new(response.into_inner(), sender);
                         tracing::info!(
                             "connected to etcd successfully, incarnation: {}",
                             self.connection_incarnation
@@ -221,16 +208,6 @@ impl ConnectionState {
 struct ConnectedWatcherStream {
     stream: Streaming<WatchResponse>,
     sender: UnboundedSender<WatchRequest>,
-    progress_request_interval: Pin<Box<Interval>>,
-    progress_notifications_requested_without_response: u8,
-}
-
-fn progress_request() -> WatchRequest {
-    WatchRequest {
-        request_union: Some(watch_request::RequestUnion::ProgressRequest(
-            WatchProgressRequest {},
-        )),
-    }
 }
 
 #[derive(Debug)]
@@ -241,26 +218,8 @@ enum DisconnectReason {
 }
 
 impl ConnectedWatcherStream {
-    const MAX_PROGRESS_NOTIFICATIONS_WITHOUT_RESPONSE: u8 = 3;
-
-    fn new(
-        stream: Streaming<WatchResponse>,
-        progress_request_interval: Duration,
-        sender: UnboundedSender<WatchRequest>,
-    ) -> Self {
-        ConnectedWatcherStream {
-            stream,
-            sender,
-            progress_request_interval: Box::pin({
-                let mut int = tokio::time::interval_at(
-                    tokio::time::Instant::now() + progress_request_interval,
-                    progress_request_interval,
-                );
-                int.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                int
-            }),
-            progress_notifications_requested_without_response: 0,
-        }
+    fn new(stream: Streaming<WatchResponse>, sender: UnboundedSender<WatchRequest>) -> Self {
+        ConnectedWatcherStream { stream, sender }
     }
 
     fn send(&mut self, request: WatchRequest) {
@@ -274,28 +233,10 @@ impl ConnectedWatcherStream {
                 _ = self.sender.closed() => {
                     return Err(DisconnectReason::SenderClosed);
                 }
-                _ = self.progress_request_interval.tick() => {
-                    // The rationale behind this is that etcd is a bit weird, and if a single watcher is un-synced, we
-                    // won't get a progress notification. So, we need to keep sending progress requests until we get a
-                    // response. If we don't get a response after a certain number of requests, we should consider the
-                    // connection dead (or perhaps even the etcd server malfunctioning, since it's got unsynced watchers
-                    // for an extended period).
-                    if self.progress_notifications_requested_without_response < Self::MAX_PROGRESS_NOTIFICATIONS_WITHOUT_RESPONSE {
-                        self.send(progress_request());
-                        self.progress_notifications_requested_without_response += 1;
-                        continue;
-                    } else {
-                        return Err(DisconnectReason::ProgressTimeout);
-                    }
-                }
             };
 
             match message {
                 Ok(Some(response)) => {
-                    if response.watch_id == PROGRESS_WATCH_ID {
-                        self.progress_notifications_requested_without_response = 0;
-                    }
-
                     return Ok(response);
                 }
                 Ok(None) => {
