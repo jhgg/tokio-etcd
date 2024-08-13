@@ -141,7 +141,7 @@ pub(crate) struct WatcherFsm {
 impl WatcherFsm {
     pub(crate) fn new(concurrent_sync_limit: usize) -> Self {
         WatcherFsm {
-            next_id: WatchId(0),
+            next_id: WatchId(1),
             states: Default::default(),
             unsynced_watchers: Default::default(),
             syncing_watchers: Default::default(),
