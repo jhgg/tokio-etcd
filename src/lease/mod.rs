@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use futures::FutureExt;
+use futures::{channel::mpsc::unbounded, FutureExt};
 use tokio::{
     sync::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
@@ -127,7 +127,9 @@ impl LeaseWorkerHandle {
     }
 
     pub(crate) fn spawn(lease_client: LeaseClient<AuthedChannel>) -> Self {
-        todo!();
+        let (lease_worker, sender) = LeaseWorker::new(lease_client);
+        tokio::spawn(lease_worker.run());
+        Self::from_sender(sender)
     }
 
     pub(crate) fn from_sender(sender: UnboundedSender<LeaseWorkerMessage>) -> Self {
@@ -208,17 +210,26 @@ enum LeaseStreamState {
     },
 }
 
-struct LeaseStreamX {
+struct LeaseStream {
     state: LeaseStreamState,
     lease_client: LeaseClient<AuthedChannel>,
     backoff: ExponentialBackoff,
 }
+
 enum LeaseStreamMessage {
     Connecting,
     Response(LeaseKeepAliveResponse),
 }
 
-impl LeaseStreamX {
+impl LeaseStream {
+    fn new(lease_client: LeaseClient<AuthedChannel>) -> Self {
+        Self {
+            state: LeaseStreamState::Disconnected,
+            lease_client,
+            backoff: ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(5)),
+        }
+    }
+
     fn can_send(&self) -> bool {
         matches!(
             self.state,
@@ -290,6 +301,7 @@ impl LeaseStreamX {
     }
 }
 
+#[derive(Default)]
 struct LeaseMap {
     leases: HashMap<LeaseId, LeaseState, IdFastHasherBuilder>,
     dq: DelayQueue<LeaseId>,
@@ -388,10 +400,10 @@ struct LeaseState {
 }
 
 struct LeaseWorker {
-    rx: UnboundedReceiver<LeaseWorkerMessage>,
+    receiver: UnboundedReceiver<LeaseWorkerMessage>,
     revoke_join_set: JoinSet<()>,
     map: LeaseMap,
-    stream: LeaseStreamX,
+    stream: LeaseStream,
 }
 
 impl LeaseWorker {
@@ -410,7 +422,7 @@ impl LeaseWorker {
             }
 
             let action = tokio::select! {
-                message = self.rx.recv() => Action::WorkerMessage(message),
+                message = self.receiver.recv() => Action::WorkerMessage(message),
                 _ = self.revoke_join_set.join_next(), if !self.revoke_join_set.is_empty() => continue,
                 lease_id = self.map.next_lease_to_keep_alive(), if self.stream.can_send() => {
                     Action::SendLeaseKeepAlive(lease_id)
@@ -519,6 +531,21 @@ impl LeaseWorker {
                 }
             }
         }
+    }
+
+    fn new(
+        lease_client: LeaseClient<AuthedChannel>,
+    ) -> (Self, UnboundedSender<LeaseWorkerMessage>) {
+        let (sender, receiver) = unbounded_channel();
+
+        let worker = Self {
+            receiver,
+            stream: LeaseStream::new(lease_client),
+            revoke_join_set: Default::default(),
+            map: Default::default(),
+        };
+
+        (worker, sender)
     }
 }
 
