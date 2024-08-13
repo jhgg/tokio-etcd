@@ -299,6 +299,16 @@ impl LeaseStream {
             }
         }
     }
+
+    fn disconnect(&mut self) {
+        self.state = LeaseStreamState::Disconnected;
+    }
+
+    fn connect(&mut self) {
+        if !matches!(self.state, LeaseStreamState::Disconnected) {
+            self.state = LeaseStreamState::Reconnecting(Box::pin(sleep(Duration::from_secs(0))));
+        }
+    }
 }
 
 #[derive(Default)]
@@ -308,6 +318,10 @@ struct LeaseMap {
 }
 
 impl LeaseMap {
+    fn is_empty(&self) -> bool {
+        self.leases.is_empty()
+    }
+
     fn keep_alive_lease(
         &mut self,
         id: LeaseId,
@@ -449,6 +463,8 @@ impl LeaseWorker {
                     self.stream.send_keep_alive(id);
                 }
             }
+
+            self.sync_connection();
         }
     }
 
@@ -546,6 +562,14 @@ impl LeaseWorker {
         };
 
         (worker, sender)
+    }
+
+    fn sync_connection(&mut self) {
+        if self.map.is_empty() {
+            self.stream.disconnect();
+        } else {
+            self.stream.connect();
+        }
     }
 }
 
