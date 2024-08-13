@@ -10,13 +10,15 @@ mod utils;
 pub mod watcher;
 
 pub use ids::{LeaseId, WatchId};
-use lease::LeaseHandle;
+use lease::{LeaseHandle, LeaseWorkerHandle, LeaseWorkerMessage};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, WeakUnboundedSender};
 pub use tokio_etcd_grpc_client::ClientEndpointConfig;
 use tokio_etcd_grpc_client::EtcdGrpcClient;
 
 pub struct Client {
     grpc_client: EtcdGrpcClient,
     watcher_singleton: WeakSingleton<watcher::WatcherHandle>,
+    lease_worker_singleton: WeakUnboundedSenderSingleton<LeaseWorkerMessage>,
 }
 
 impl Client {
@@ -28,6 +30,7 @@ impl Client {
         Self {
             grpc_client,
             watcher_singleton: WeakSingleton::new(),
+            lease_worker_singleton: WeakUnboundedSenderSingleton::new(),
         }
     }
 
@@ -67,7 +70,17 @@ impl Client {
     ///
     /// `ttl` must be above 10 seconds.
     pub async fn grant_lease(&self, ttl: Duration) -> Result<LeaseHandle, Status> {
-        LeaseHandle::grant(self.grpc_client.lease(), ttl).await
+        let sender = self.lease_worker_singleton.get_or_init(|| {
+            let handle = LeaseWorkerHandle::spawn(self.grpc_client.lease());
+            handle.into_inner()
+        });
+
+        LeaseHandle::grant(
+            self.grpc_client.lease(),
+            LeaseWorkerHandle::from_sender(sender),
+            ttl,
+        )
+        .await
     }
 }
 
@@ -93,6 +106,36 @@ impl<T> WeakSingleton<T> {
             let arc = Arc::new(init());
             *lock = Arc::downgrade(&arc);
             arc
+        }
+    }
+}
+
+struct WeakUnboundedSenderSingleton<T> {
+    inner: Mutex<WeakUnboundedSender<T>>,
+}
+
+impl<T> WeakUnboundedSenderSingleton<T> {
+    fn new() -> Self {
+        // This is kinda awful, but tokio provides no way to create a "weak unbounded sender" without first creating a tx/rx pair.
+        let (tx, rx) = unbounded_channel();
+        let weak_tx = tx.downgrade();
+        drop(rx);
+
+        Self {
+            inner: Mutex::new(weak_tx),
+        }
+    }
+
+    fn get_or_init(&self, init: impl FnOnce() -> UnboundedSender<T>) -> UnboundedSender<T> {
+        let mut lock = self.inner.lock().unwrap();
+        if let Some(inner) = lock.upgrade() {
+            inner
+        } else {
+            let tx = init();
+            let weak_tx = tx.downgrade();
+
+            *lock = weak_tx;
+            tx
         }
     }
 }

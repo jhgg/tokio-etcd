@@ -116,7 +116,7 @@ impl WatcherState {
                     key: self.key.0.clone().into_vec(),
                     range_end: vec![],
                     start_revision: self.revision + 1,
-                    progress_notify: false,
+                    progress_notify: true,
                     filters: vec![],
                     prev_kv: false,
                     watch_id: self.id.get() as _,
@@ -141,7 +141,7 @@ pub(crate) struct WatcherFsm {
 impl WatcherFsm {
     pub(crate) fn new(concurrent_sync_limit: usize) -> Self {
         WatcherFsm {
-            next_id: WatchId(0),
+            next_id: WatchId(1),
             states: Default::default(),
             unsynced_watchers: Default::default(),
             syncing_watchers: Default::default(),
@@ -342,22 +342,6 @@ impl WatcherFsm {
         &mut self,
         response: WatchResponse,
     ) -> Option<(WatchId, ProcessedWatchResponse)> {
-        // When receiving a progress notification, we can update the revision for all watchers, so that
-        // when we re-sync them, we'll start from a more recent revision, rather than an older one,
-        // which might be compacted.
-        if response.is_progress_notify() && response.watch_id == PROGRESS_WATCH_ID {
-            let revision = response
-                .header
-                .expect("invariant: header is always present")
-                .revision;
-
-            for state in self.states.values_mut() {
-                state.revision = state.revision.max(revision);
-            }
-
-            return None;
-        }
-
         let watch_id = WatchId(response.watch_id as _);
 
         // There is a chance that we may receive a watch response for a watcher we already don't care about.
@@ -385,7 +369,7 @@ impl WatcherFsm {
                 }),
             ))
         } else {
-            let events = self.update_watcher(watch_id, |mut s| {
+            let response = self.update_watcher(watch_id, |mut s| {
                 if response.compact_revision != 0 {
                     tracing::warn!(
                         "when trying to sync watcher {:?} at revision {}, etcd server returned a compact revision of
@@ -395,29 +379,35 @@ impl WatcherFsm {
                     *s.sync_state = WatcherSyncState::Unsynced;
                     // fixme: log compact revision properly, we need to re-fetch the entire key potentially?
                     *s.revision = response.compact_revision;
-                    return vec![];
+                    return ProcessedWatchResponse::CompactRevision { revision: response.compact_revision };
                 }
+
+                let revision = response
+                        .header
+                        .expect("invariant: header is always present")
+                        .revision;
 
                 // the server has acknowledged the watcher, so we can mark it as synced.
                 if response.created {
                     tracing::info!("watcher {:?} synced", watch_id);
                     *s.sync_state = WatcherSyncState::Synced;
                 } else {
-                    *s.revision = response
-                        .header
-                        .expect("invariant: header is always present")
-                        .revision;
+                    *s.revision = revision;
                 }
 
-                let mut watch_events = Vec::with_capacity(response.events.len());
+                if response.is_progress_notify() {
+                    return ProcessedWatchResponse::Progress { revision };
+                }
+
+                let mut events = Vec::with_capacity(response.events.len());
                 for event in response.events {
-                    watch_events.push(s.handle_event(event));
+                    events.push(s.handle_event(event));
                 }
 
-                watch_events
+                ProcessedWatchResponse::Events { events, revision }
             })?;
 
-            Some((watch_id, ProcessedWatchResponse::Events(events)))
+            Some((watch_id, response))
         }
     }
 }
@@ -433,7 +423,14 @@ pub enum ProcessedWatchResponse {
     /// The watcher was cancelled by the server.
     Cancelled(WatchCancelledByServer),
     /// The watcher emitted the following events.
-    Events(Vec<WatcherEvent>),
+    Events {
+        events: Vec<WatcherEvent>,
+        revision: i64,
+    },
+    /// The watcher notified progress which updated the revision.
+    Progress { revision: i64 },
+    /// The watcher revision was compacted.
+    CompactRevision { revision: i64 },
 }
 
 #[derive(Debug, Error, Clone)]

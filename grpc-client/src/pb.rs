@@ -28,6 +28,6 @@ impl etcdserverpb::WatchResponse {
             && !self.canceled
             && !self.created
             && self.compact_revision == 0
-            && self.header.map_or(0, |h| h.revision) == 0
+            && self.header.map_or(0, |h| h.revision) != 0
     }
 }

@@ -264,12 +264,14 @@ impl KeySet {
                 state.sender.send(Err(reason)).ok();
                 self.remove(id);
             }
-            ProcessedWatchResponse::Events(events) => {
+            ProcessedWatchResponse::Events { events, .. } => {
                 for event in events {
                     state.value = event.value;
                     state.sender.send(Ok(state.value.clone())).ok();
                 }
             }
+            ProcessedWatchResponse::CompactRevision { revision } => {}
+            ProcessedWatchResponse::Progress { revision } => {}
         }
     }
 
@@ -341,7 +343,6 @@ struct WatcherWorker {
 
 impl WatcherWorker {
     const CONCURRENT_SYNC_LIMIT: usize = 5;
-    const PROGRESS_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
     const BROADCAST_CHANNEL_CAPACITY: usize = 16;
 
     fn new(
@@ -356,11 +357,7 @@ impl WatcherWorker {
             kv_client,
             in_progress_reads: Default::default(),
             watched_keys: Default::default(),
-            watcher_fsm_client: WatcherFsmClient::new(
-                watch_client,
-                Self::PROGRESS_REQUEST_INTERVAL,
-                Self::CONCURRENT_SYNC_LIMIT,
-            ),
+            watcher_fsm_client: WatcherFsmClient::new(watch_client, Self::CONCURRENT_SYNC_LIMIT),
             range_request_join_set: JoinSet::new(),
         }
     }
