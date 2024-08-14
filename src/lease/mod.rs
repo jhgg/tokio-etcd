@@ -178,7 +178,7 @@ impl LeaseHandle {
 
     /// Returns the lease id, or None if the lease has expired.
     pub fn id(&self) -> Option<LeaseId> {
-        self.inner.notify.is_revoked().then_some(self.inner.id)
+        (!self.inner.notify.is_revoked()).then_some(self.inner.id)
     }
 
     /// Monitors the lease, returning if the lease for whatever reason was revoked or expired by the server
