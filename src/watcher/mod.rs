@@ -2,14 +2,13 @@ mod fsm;
 mod fsm_client;
 
 use std::{
-    collections::{hash_map::Entry, HashMap, VecDeque},
-    future::{pending, Future},
+    collections::{hash_map::Entry, HashMap},
+    future::Future,
     panic,
     pin::Pin,
-    time::Duration,
 };
 
-use fsm::{ProcessedWatchResponse, WatchCancelledByServer, WatcherValue};
+use fsm::{ProcessedWatchResponse, WatchCancelledByServer, WatchConfig, WatcherValue};
 use fsm_client::WatcherFsmClient;
 use thiserror::Error;
 use tokio::{
@@ -188,7 +187,7 @@ type InitialWatchSender = tokio::sync::oneshot::Sender<Result<Watched, WatchErro
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Key(Box<[u8]>);
+pub struct Key(Option<Box<[u8]>>);
 
 impl From<String> for Key {
     fn from(value: String) -> Self {
@@ -204,7 +203,7 @@ impl From<Vec<u8>> for Key {
 
 impl From<Box<[u8]>> for Key {
     fn from(value: Box<[u8]>) -> Self {
-        Self(value)
+        Self(Some(value))
     }
 }
 
@@ -217,13 +216,34 @@ impl From<&str> for Key {
 impl Key {
     fn make_range_request(&self) -> RangeRequest {
         RangeRequest {
-            key: self.0.clone().into_vec(),
+            key: match self.0.clone() {
+                Some(x) => x.into_vec(),
+                None => Vec::new(),
+            },
             ..Default::default()
         }
     }
 
     fn new(key: impl Into<Box<[u8]>>) -> Self {
-        Self(key.into())
+        Self(Some(key.into()))
+    }
+
+    fn as_vec(&self) -> Vec<u8> {
+        match &self.0 {
+            Some(data) => data.clone().into_vec(),
+            None => Vec::new(),
+        }
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        match self.0 {
+            Some(data) => data.into_vec(),
+            None => Vec::new(),
+        }
+    }
+
+    pub fn empty() -> Key {
+        Self(None)
     }
 }
 
@@ -270,8 +290,8 @@ impl KeySet {
                     state.sender.send(Ok(state.value.clone())).ok();
                 }
             }
-            ProcessedWatchResponse::CompactRevision { revision } => {}
-            ProcessedWatchResponse::Progress { revision } => {}
+            ProcessedWatchResponse::CompactRevision { .. }
+            | ProcessedWatchResponse::Progress { .. } => {}
         }
     }
 
@@ -447,7 +467,9 @@ impl WatcherWorker {
 
                 // Now, begin watching:
                 let watch_id = {
-                    let watch_id = self.watcher_fsm_client.add_watcher(key.clone(), revision);
+                    let watch_id = self.watcher_fsm_client.add_watcher(
+                        WatchConfig::for_key(key.clone()).with_start_revision(revision + 1),
+                    );
                     let state = self
                         .watched_keys
                         .insert(key, watch_id, Self::BROADCAST_CHANNEL_CAPACITY, value)

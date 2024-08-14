@@ -11,7 +11,7 @@ use tonic::{Response, Status, Streaming};
 use crate::{utils::backoff::ExponentialBackoff, WatchId};
 
 use super::{
-    fsm::{ProcessedWatchResponse, WatcherFsm},
+    fsm::{ProcessedWatchResponse, WatchConfig, WatcherFsm},
     BoxFuture, Key,
 };
 
@@ -34,23 +34,22 @@ impl WatcherFsmClient {
         }
     }
 
-    pub fn add_watcher(&mut self, key: Key, revision: i64) -> WatchId {
-        // fixme: can we get rid of the clone?
-        let watch_id = self.do_fsm_action(|fsm| fsm.add_watcher(key.clone(), revision));
-        tracing::info!("added watcher, key: {:?}, watch_id: {:?}", key, watch_id);
+    pub fn add_watcher(&mut self, watch_config: WatchConfig) -> WatchId {
+        let watch_id = self.do_fsm_action(|fsm| fsm.add_watcher(watch_config));
+        tracing::info!("added watcher: {:?}", watch_id);
 
         watch_id
     }
 
-    pub fn cancel_watcher(&mut self, watch_id: WatchId) -> Option<Key> {
-        let key = self.do_fsm_action(|fsm| fsm.cancel_watcher(watch_id))?;
+    pub fn cancel_watcher(&mut self, watch_id: WatchId) -> Option<WatchConfig> {
+        let config = self.do_fsm_action(|fsm| fsm.cancel_watcher(watch_id))?;
         tracing::info!(
             "cancelled watcher, key: {:?}, watch_id: {:?}",
-            key,
+            config.key(),
             watch_id
         );
 
-        Some(key)
+        Some(config)
     }
 
     /// This future is cancel safe.
@@ -212,7 +211,6 @@ struct ConnectedWatcherStream {
 
 #[derive(Debug)]
 enum DisconnectReason {
-    ProgressTimeout,
     StreamEnded,
     SenderClosed,
 }
