@@ -5,7 +5,8 @@ use std::{
 
 use thiserror::Error;
 use tokio_etcd_grpc_client::{
-    watch_request, Event, EventType, KeyValue, WatchRequest, WatchResponse,
+    watch_create_request::FilterType, watch_request, Event, EventType, KeyValue, WatchRequest,
+    WatchResponse,
 };
 
 use super::{util::range_end_for_prefix, Key};
@@ -107,14 +108,15 @@ impl WatcherState {
         WatchRequest {
             request_union: Some(watch_request::RequestUnion::CreateRequest(
                 tokio_etcd_grpc_client::WatchCreateRequest {
+                    watch_id: self.id.get() as _,
+                    fragment: true,
+                    progress_notify: true,
+                    // configured values:
                     key: self.config.key.as_vec(),
                     range_end: self.config.range_end.as_vec(),
                     start_revision: self.config.start_revision.unwrap_or_default(),
-                    progress_notify: true,
-                    filters: vec![],
-                    prev_kv: false,
-                    watch_id: self.id.get() as _,
-                    fragment: true,
+                    filters: self.config.filters.for_proto(),
+                    prev_kv: self.config.prev_kv,
                 },
             )),
         }
@@ -127,11 +129,43 @@ pub struct WatchFilters {
 }
 
 impl WatchFilters {
-    fn all() -> Self {
+    /// Don't filter anything
+    pub fn all() -> Self {
         Self {
             put: true,
             delete: true,
         }
+    }
+
+    /// Only watch for puts
+    pub fn only_put() -> Self {
+        Self {
+            put: true,
+            delete: false,
+        }
+    }
+
+    /// Only watch for deletes
+    pub fn only_delete() -> Self {
+        Self {
+            put: false,
+            delete: true,
+        }
+    }
+
+    fn for_proto(&self) -> Vec<i32> {
+        let mut data =
+            Vec::with_capacity(if self.put { 0 } else { 1 } + if self.delete { 0 } else { 1 });
+
+        if !self.put {
+            data.push(FilterType::Noput as i32);
+        }
+
+        if !self.delete {
+            data.push(FilterType::Nodelete as i32);
+        }
+
+        data
     }
 }
 
