@@ -8,7 +8,7 @@ use tokio_etcd_grpc_client::{
     watch_request, Event, EventType, KeyValue, WatchRequest, WatchResponse,
 };
 
-use super::Key;
+use super::{util::range_end_for_prefix, Key};
 use crate::{ids::IdFastHasherBuilder, LeaseId, WatchId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,20 +143,46 @@ pub struct WatchConfig {
     start_revision: Option<i64>,
 }
 
+#[derive(Debug, Error)]
+#[error("key cannot be empty")]
+pub struct KeyIsEmpty;
+
 impl WatchConfig {
-    pub fn for_key(key: Key) -> Self {
+    fn with_key_and_range_end(key: Key, range_end: Key) -> Self {
         Self {
             key,
-            range_end: Key::empty(),
+            range_end,
             filters: WatchFilters::all(),
             prev_kv: false,
             start_revision: None,
         }
     }
 
-    pub fn with_range_end(mut self, range_end: Key) -> Self {
-        self.range_end = range_end;
-        self
+    /// Watches a singular key.
+    pub fn for_single_key(key: Key) -> Self {
+        Self::with_key_and_range_end(key, Key::empty())
+    }
+
+    /// Watches all keys with the given prefix.
+    ///
+    /// Note: The key must be non-empty or an error is returned. If you want to watch all keys, use the
+    /// [`Self::for_all_keys`] method instead.
+    pub fn for_keys_with_prefix(prefix: Key) -> Result<Self, KeyIsEmpty> {
+        let range_end = Key::from(range_end_for_prefix(prefix.as_slice().ok_or(KeyIsEmpty)?));
+        Ok(Self::with_key_and_range_end(prefix, range_end))
+    }
+
+    /// Watches all keys on the server.
+    ///
+    /// Note: Depending on the data in your etcd server, this can be a very busy watcher, so use with caution.
+    pub fn for_all_keys() -> Self {
+        let null_key = Key::from(vec![0]);
+        Self::with_key_and_range_end(null_key.clone(), null_key)
+    }
+
+    /// Watches keys that are greater than or equal to the provided `key`.
+    pub fn for_keys_greater_than_or_equal_to(key: Key) -> Self {
+        Self::with_key_and_range_end(key, Key::from(vec![0]))
     }
 
     pub fn with_start_revision(mut self, revision: i64) -> Self {

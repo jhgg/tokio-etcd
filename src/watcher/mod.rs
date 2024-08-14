@@ -1,5 +1,6 @@
 mod fsm;
 mod fsm_client;
+mod util;
 
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -232,6 +233,13 @@ impl Key {
         match &self.0 {
             Some(data) => data.clone().into_vec(),
             None => Vec::new(),
+        }
+    }
+
+    fn as_slice(&self) -> Option<&[u8]> {
+        match &self.0 {
+            Some(data) => Some(&data),
+            None => None,
         }
     }
 
@@ -468,7 +476,7 @@ impl WatcherWorker {
                 // Now, begin watching:
                 let watch_id = {
                     let watch_id = self.watcher_fsm_client.add_watcher(
-                        WatchConfig::for_key(key.clone()).with_start_revision(revision + 1),
+                        WatchConfig::for_single_key(key.clone()).with_start_revision(revision + 1),
                     );
                     let state = self
                         .watched_keys
