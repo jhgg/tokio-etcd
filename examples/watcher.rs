@@ -1,6 +1,6 @@
 use tokio::task::JoinHandle;
 use tokio_etcd::{
-    watcher::{CoalescedWatch, Key, WatchError},
+    watcher::{CoalescedWatch, Key, WatchConfig, WatchError},
     Client, ClientEndpointConfig,
 };
 
@@ -15,6 +15,7 @@ async fn main() {
         spawn_watcher_task(1, &client, "hello"),
         spawn_watcher_task(2, &client, "world"),
         spawn_watcher_task(3, &client, "world"),
+        spawn_watch_all(&client),
     ];
 
     for jh in jhs {
@@ -45,6 +46,27 @@ fn spawn_watcher_task(
                 }
                 Err(cancelled) => {
                     println!("{i}: watch cancelled: {cancelled:?}");
+                    return Ok(());
+                }
+            }
+        }
+    })
+}
+
+fn spawn_watch_all(client: &Client) -> JoinHandle<Result<(), WatchError>> {
+    let watcher = client.watcher();
+    tokio::task::spawn(async move {
+        let mut r = watcher
+            .watch_with_config(WatchConfig::for_all_keys())
+            .await?;
+
+        loop {
+            match r.recv().await {
+                Ok(events) => {
+                    println!("all: events: {events:?}");
+                }
+                Err(cancelled) => {
+                    println!("all: watch cancelled: {cancelled:?}");
                     return Ok(());
                 }
             }

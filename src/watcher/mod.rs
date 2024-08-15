@@ -4,14 +4,10 @@ mod util;
 
 use std::{
     collections::{hash_map::Entry, HashMap},
-    future::Future,
     panic,
-    pin::Pin,
 };
 
-use fsm::{
-    ProcessedWatchResponse, WatchCancelledByServer, WatchConfig, WatcherEvent, WatcherValue,
-};
+use fsm::{ProcessedWatchResponse, WatchCancelledByServer, WatcherEvent, WatcherValue};
 use fsm_client::WatcherFsmClient;
 use thiserror::Error;
 use tokio::{
@@ -21,8 +17,12 @@ use tokio::{
     },
     task::JoinSet,
 };
-use tokio_etcd_grpc_client::{AuthedChannel, KvClient, RangeRequest, RangeResponse, WatchClient};
+use tokio_etcd_grpc_client::{
+    watch_create_request::FilterType, AuthedChannel, KvClient, RangeRequest, RangeResponse,
+    WatchClient,
+};
 use tonic::{Response, Status};
+use util::range_end_for_prefix;
 
 use crate::{ids::IdFastHasherBuilder, WatchId};
 
@@ -75,7 +75,7 @@ impl WatcherHandle {
     pub async fn watch_with_config(
         &self,
         watch_config: WatchConfig,
-    ) -> Result<ForwardedWatch, WatchError> {
+    ) -> Result<ForwardedWatchReceiver, WatchError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(WorkerMessage::WatchAndForward {
@@ -201,11 +201,7 @@ impl CoalescedWatcherReceiver {
     }
 }
 
-pub struct ForwardedWatch {
-    receiver: ForwardedWatchReceiver,
-}
-
-struct ForwardedWatchReceiver {
+pub struct ForwardedWatchReceiver {
     state: ReceiverState<UnboundedReceiver<Result<Vec<WatcherEvent>, WatchCancelledByServer>>>,
 }
 
@@ -255,7 +251,8 @@ pub enum WatchError {
 }
 
 type InitialCoalescedWatchSender = tokio::sync::oneshot::Sender<Result<CoalescedWatch, WatchError>>;
-type InitialForwardedWatchSender = tokio::sync::oneshot::Sender<Result<ForwardedWatch, WatchError>>;
+type InitialForwardedWatchSender =
+    tokio::sync::oneshot::Sender<Result<ForwardedWatchReceiver, WatchError>>;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Key(Option<Box<[u8]>>);
@@ -731,9 +728,124 @@ impl WatcherWorker {
             .expect("invariant: insert should always succeed");
 
         initial_sender
-            .send(Ok(ForwardedWatch {
-                receiver: ForwardedWatchReceiver::new(receiver, tx, id),
-            }))
+            .send(Ok(ForwardedWatchReceiver::new(receiver, tx, id)))
             .ok();
+    }
+}
+
+pub struct WatchConfig {
+    key: Key,
+    range_end: Key,
+    events: WatchEvents,
+    prev_kv: bool,
+    start_revision: Option<i64>,
+}
+
+#[derive(Debug, Error)]
+#[error("key cannot be empty")]
+pub struct KeyIsEmpty;
+
+impl WatchConfig {
+    fn with_key_and_range_end(key: Key, range_end: Key) -> Self {
+        Self {
+            key,
+            range_end,
+            events: WatchEvents::all(),
+            prev_kv: false,
+            start_revision: None,
+        }
+    }
+
+    /// Watches a singular key.
+    pub fn for_single_key(key: Key) -> Self {
+        Self::with_key_and_range_end(key, Key::empty())
+    }
+
+    /// Watches all keys with the given prefix.
+    ///
+    /// Note: The key must be non-empty or an error is returned. If you want to watch all keys, use the
+    /// [`Self::for_all_keys`] method instead.
+    pub fn for_keys_with_prefix(prefix: Key) -> Result<Self, KeyIsEmpty> {
+        let range_end = Key::from(range_end_for_prefix(prefix.as_slice().ok_or(KeyIsEmpty)?));
+        Ok(Self::with_key_and_range_end(prefix, range_end))
+    }
+
+    /// Watches all keys on the server.
+    ///
+    /// Note: Depending on the data in your etcd server, this can be a very busy watcher, so use with caution.
+    pub fn for_all_keys() -> Self {
+        let null_key = Key::from(vec![0]);
+        Self::with_key_and_range_end(null_key.clone(), null_key)
+    }
+
+    /// Watches keys that are greater than or equal to the provided `key`.
+    pub fn for_keys_greater_than_or_equal_to(key: Key) -> Self {
+        Self::with_key_and_range_end(key, Key::from(vec![0]))
+    }
+
+    pub fn with_start_revision(mut self, revision: i64) -> Self {
+        self.start_revision = Some(revision);
+        self
+    }
+
+    pub fn with_events(mut self, events: WatchEvents) -> Self {
+        self.events = events;
+        self
+    }
+
+    pub fn with_prev_kv(mut self, prev_kv: bool) -> Self {
+        self.prev_kv = prev_kv;
+        self
+    }
+
+    pub fn key(&self) -> &Key {
+        &self.key
+    }
+}
+
+pub struct WatchEvents {
+    put: bool,
+    delete: bool,
+}
+
+impl WatchEvents {
+    /// Watch should include all events.
+    pub fn all() -> Self {
+        Self {
+            put: true,
+            delete: true,
+        }
+    }
+
+    /// Only watch for puts
+    pub fn only_put() -> Self {
+        Self {
+            put: true,
+            delete: false,
+        }
+    }
+
+    /// Only watch for deletes
+    pub fn only_delete() -> Self {
+        Self {
+            put: false,
+            delete: true,
+        }
+    }
+
+    /// Convert this to a list of filter types for proto.
+    fn for_filters_proto(&self) -> Vec<i32> {
+        let mut data =
+            Vec::with_capacity(if self.put { 0 } else { 1 } + if self.delete { 0 } else { 1 });
+
+        if !self.put {
+            data.push(FilterType::Noput as i32);
+        }
+
+        if !self.delete {
+            data.push(FilterType::Nodelete as i32);
+        }
+
+        data
     }
 }

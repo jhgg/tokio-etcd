@@ -12,8 +12,8 @@ use tonic::{Response, Status, Streaming};
 use crate::{utils::backoff::ExponentialBackoff, WatchId};
 
 use super::{
-    fsm::{ProcessedWatchResponse, WatchConfig, WatcherFsm},
-    Key,
+    fsm::{ProcessedWatchResponse, WatcherFsm},
+    Key, WatchConfig,
 };
 
 pub(crate) struct WatcherFsmClient {
