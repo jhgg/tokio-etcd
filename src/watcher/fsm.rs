@@ -429,6 +429,7 @@ enum CancelSource {
     Server,
 }
 
+#[derive(Debug)]
 pub enum ProcessedWatchResponse {
     /// The watcher was cancelled by the server.
     Cancelled(WatchCancelledByServer),
@@ -441,6 +442,16 @@ pub enum ProcessedWatchResponse {
     Progress { revision: i64 },
     /// The watcher revision was compacted.
     CompactRevision { revision: i64 },
+}
+
+impl ProcessedWatchResponse {
+    /// Returns `true` if the processed watch response is [`Cancelled`].
+    ///
+    /// [`Cancelled`]: ProcessedWatchResponse::Cancelled
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled(..))
+    }
 }
 
 #[derive(Debug, Error, Clone)]

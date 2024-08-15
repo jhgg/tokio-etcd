@@ -79,10 +79,7 @@ impl WatcherHandle {
     /// Watches a key in etcd, using the given [`WatchConfig`].
     ///
     /// The watcher will be automatically cancelled when the returned [`ForwardedWatchReceiver`] is dropped.
-    pub async fn watch_with_config(
-        &self,
-        watch_config: WatchConfig,
-    ) -> Result<ForwardedWatchReceiver, WatchError> {
+    pub async fn watch_with_config(&self, watch_config: WatchConfig) -> ForwardedWatchReceiver {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(WorkerMessage::WatchAndForward {
@@ -209,12 +206,12 @@ impl CoalescedWatcherReceiver {
 }
 
 pub struct ForwardedWatchReceiver {
-    state: ReceiverState<UnboundedReceiver<Result<Vec<WatcherEvent>, WatchCancelledByServer>>>,
+    state: ReceiverState<UnboundedReceiver<ProcessedWatchResponse>>,
 }
 
 impl ForwardedWatchReceiver {
     fn new(
-        receiver: UnboundedReceiver<Result<Vec<WatcherEvent>, WatchCancelledByServer>>,
+        receiver: UnboundedReceiver<ProcessedWatchResponse>,
         tx: UnboundedSender<WorkerMessage>,
         id: WatchId,
     ) -> Self {
@@ -226,28 +223,27 @@ impl ForwardedWatchReceiver {
         }
     }
 
-    // fixme: this should just return a ProcessedWatchResponse.
-    pub async fn recv(&mut self) -> Result<Vec<WatcherEvent>, WatchCancelledByServer> {
+    pub async fn recv(&mut self) -> ProcessedWatchResponse {
         match &mut self.state {
             ReceiverState::Active {
                 receiver,
                 drop_guard,
             } => match receiver.recv().await {
-                Some(Ok(value)) => return Ok(value),
-                Some(Err(cancelled)) => {
+                Some(ProcessedWatchResponse::Cancelled(reason)) => {
                     drop_guard.disarm();
-                    self.state = ReceiverState::Cancelled(cancelled.clone());
-                    return Err(cancelled);
+                    self.state = ReceiverState::Cancelled(reason.clone());
+                    ProcessedWatchResponse::Cancelled(reason)
                 }
+                Some(response) => response,
                 None => {
-                    let err = WatchCancelledByServer {
+                    let reason = WatchCancelledByServer {
                         reason: "watcher receiver closed".into(),
                     };
-                    self.state = ReceiverState::Cancelled(err.clone());
-                    return Err(err);
+                    self.state = ReceiverState::Cancelled(reason.clone());
+                    ProcessedWatchResponse::Cancelled(reason)
                 }
             },
-            ReceiverState::Cancelled(err) => return Err(err.clone()),
+            ReceiverState::Cancelled(reason) => ProcessedWatchResponse::Cancelled(reason.clone()),
         }
     }
 }
@@ -259,8 +255,7 @@ pub enum WatchError {
 }
 
 type InitialCoalescedWatchSender = tokio::sync::oneshot::Sender<Result<CoalescedWatch, WatchError>>;
-type InitialForwardedWatchSender =
-    tokio::sync::oneshot::Sender<Result<ForwardedWatchReceiver, WatchError>>;
+type InitialForwardedWatchSender = tokio::sync::oneshot::Sender<ForwardedWatchReceiver>;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Key(Option<Box<[u8]>>);
@@ -335,27 +330,18 @@ struct KeyWatchState {
     watch_type: KeyWatchType,
 }
 impl KeyWatchState {
-    fn send_cancelled(&mut self, reason: WatchCancelledByServer) {
-        match &self.watch_type {
-            KeyWatchType::CoalescedKey { sender, .. } => {
-                sender.send(Err(reason)).ok();
-            }
-            KeyWatchType::ForwardEvents { sender } => {
-                sender.send(Err(reason)).ok();
-            }
-        }
-    }
-
-    fn send_events(&mut self, events: Vec<WatcherEvent>) {
+    fn send_response(&mut self, response: ProcessedWatchResponse) {
         match &mut self.watch_type {
             KeyWatchType::CoalescedKey { value, sender, .. } => {
-                for event in events {
-                    *value = event.value;
-                    sender.send(Ok(value.clone())).ok();
+                if let ProcessedWatchResponse::Events { events, .. } = response {
+                    for event in events {
+                        *value = event.value;
+                        sender.send(Ok(value.clone())).ok();
+                    }
                 }
             }
             KeyWatchType::ForwardEvents { sender } => {
-                sender.send(Ok(events)).ok();
+                sender.send(response).ok();
             }
         }
     }
@@ -369,7 +355,7 @@ enum KeyWatchType {
         sender: broadcast::Sender<Result<WatcherValue, WatchCancelledByServer>>,
     },
     ForwardEvents {
-        sender: mpsc::UnboundedSender<Result<Vec<WatcherEvent>, WatchCancelledByServer>>,
+        sender: mpsc::UnboundedSender<ProcessedWatchResponse>,
     },
 }
 
@@ -407,16 +393,11 @@ impl WatchedSet {
             return;
         };
 
-        match response {
-            ProcessedWatchResponse::Cancelled(reason) => {
-                state.send_cancelled(reason);
-                self.remove(id);
-            }
-            ProcessedWatchResponse::Events { events, .. } => {
-                state.send_events(events);
-            }
-            ProcessedWatchResponse::CompactRevision { .. }
-            | ProcessedWatchResponse::Progress { .. } => {}
+        let is_cancelled = response.is_cancelled();
+        state.send_response(response);
+
+        if is_cancelled {
+            self.remove(id);
         }
     }
 
@@ -736,7 +717,7 @@ impl WatcherWorker {
             .expect("invariant: insert should always succeed");
 
         initial_sender
-            .send(Ok(ForwardedWatchReceiver::new(receiver, tx, id)))
+            .send(ForwardedWatchReceiver::new(receiver, tx, id))
             .ok();
     }
 }
