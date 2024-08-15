@@ -2,6 +2,8 @@
 name = "tokio-etcd-grpc-client"
 version = "0.1.0"
 edition = "2021"
+description = "The crate containing the generated protobufs/clients for tokio-etcd. Not recommended for direct use."
+license = "MIT"
 
 [dependencies]
 tonic = "0.12"

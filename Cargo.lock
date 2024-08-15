@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "tokio-etcd"
-version = "0.1.0"
+version = "0.0.0-alpha0"
 dependencies = [
  "arc-swap",
  "expect-test",

@@ -1,7 +1,9 @@
 [package]
 name = "tokio-etcd"
-version = "0.1.0"
+version = "0.0.0-alpha0"
 edition = "2021"
+description = "An opinionated etcd client for use with tokio"
+license = "MIT"
 
 [dependencies]
 arc-swap = "1.7.1"
@@ -12,7 +14,7 @@ tokio-stream = { version = "0.1.15", features = ["sync"] }
 tonic = "0.12.1"
 tracing = { version = "0.1.40", features = ["log"] }
 
-tokio-etcd-grpc-client = { path = "./grpc-client" }
+tokio-etcd-grpc-client = { path = "./grpc-client", version = "0.1.0" }
 rand = "0.8.5"
 tokio-util = { version = "0.7.11", features = ["time"] }
 futures = "0.3"
