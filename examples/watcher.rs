@@ -1,6 +1,6 @@
 use tokio::task::JoinHandle;
 use tokio_etcd::{
-    watcher::{Key, WatchError, Watched},
+    watcher::{CoalescedWatch, Key, WatchError},
     Client, ClientEndpointConfig,
 };
 
@@ -31,10 +31,10 @@ fn spawn_watcher_task(
     let key = Key::from(key.into());
 
     tokio::task::spawn(async move {
-        let Watched {
+        let CoalescedWatch {
             value,
             mut receiver,
-        } = watcher.watch_key(key).await?;
+        } = watcher.watch_key_coalesced(key).await?;
 
         println!("{i}: watch state: {value:?}");
 

@@ -5,10 +5,11 @@ use std::{
 
 use thiserror::Error;
 use tokio_etcd_grpc_client::{
-    watch_request, Event, EventType, KeyValue, WatchRequest, WatchResponse, PROGRESS_WATCH_ID,
+    watch_create_request::FilterType, watch_request, Event, EventType, KeyValue, WatchRequest,
+    WatchResponse,
 };
 
-use super::Key;
+use super::{util::range_end_for_prefix, Key};
 use crate::{ids::IdFastHasherBuilder, LeaseId, WatchId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,21 +25,14 @@ enum WatcherSyncState {
 
 struct WatcherState {
     id: WatchId,
-    key: Key,
+    config: WatchConfig,
     sync_state: WatcherSyncState,
-    /// The revision which we last received from the etcd server either by virtue of getting a watch response,
-    /// or by a progress notification.
-    ///
-    /// This value is distinct from the WatcherValue's revision, as it represents the the latest revision from etcd
-    /// that we know about, and not the revision of the value itself, which may be older, and unable to be watched
-    /// (as it may have been compacted).
-    revision: i64,
 }
 
 // A subset of the WatcherState, which contains mutable references to fields that are safe to update.
 struct UpdatableWatcherState<'a> {
     sync_state: &'a mut WatcherSyncState,
-    revision: &'a mut i64,
+    start_revision: &'a mut Option<i64>,
 }
 
 pub struct WatcherEvent {
@@ -88,7 +82,8 @@ impl UpdatableWatcherState<'_> {
     fn handle_event(&mut self, event: Event) -> WatcherEvent {
         let event_type = event.r#type();
         let kv = event.kv.expect("invariant: kv is always present");
-        *self.revision = kv.mod_revision.max(*self.revision);
+        *self.start_revision =
+            Some(kv.mod_revision.max(self.start_revision.unwrap_or_default()) + 1);
 
         WatcherEvent {
             key: kv.key.into(),
@@ -113,17 +108,135 @@ impl WatcherState {
         WatchRequest {
             request_union: Some(watch_request::RequestUnion::CreateRequest(
                 tokio_etcd_grpc_client::WatchCreateRequest {
-                    key: self.key.0.clone().into_vec(),
-                    range_end: vec![],
-                    start_revision: self.revision + 1,
-                    progress_notify: true,
-                    filters: vec![],
-                    prev_kv: false,
                     watch_id: self.id.get() as _,
                     fragment: true,
+                    progress_notify: true,
+                    // configured values:
+                    key: self.config.key.as_vec(),
+                    range_end: self.config.range_end.as_vec(),
+                    start_revision: self.config.start_revision.unwrap_or_default(),
+                    filters: self.config.events.for_filters_proto(),
+                    prev_kv: self.config.prev_kv,
                 },
             )),
         }
+    }
+}
+
+pub struct WatchEvents {
+    put: bool,
+    delete: bool,
+}
+
+impl WatchEvents {
+    /// Watch should include all events.
+    pub fn all() -> Self {
+        Self {
+            put: true,
+            delete: true,
+        }
+    }
+
+    /// Only watch for puts
+    pub fn only_put() -> Self {
+        Self {
+            put: true,
+            delete: false,
+        }
+    }
+
+    /// Only watch for deletes
+    pub fn only_delete() -> Self {
+        Self {
+            put: false,
+            delete: true,
+        }
+    }
+
+    /// Convert this to a list of filter types for proto.
+    fn for_filters_proto(&self) -> Vec<i32> {
+        let mut data =
+            Vec::with_capacity(if self.put { 0 } else { 1 } + if self.delete { 0 } else { 1 });
+
+        if !self.put {
+            data.push(FilterType::Noput as i32);
+        }
+
+        if !self.delete {
+            data.push(FilterType::Nodelete as i32);
+        }
+
+        data
+    }
+}
+
+pub struct WatchConfig {
+    key: Key,
+    range_end: Key,
+    events: WatchEvents,
+    prev_kv: bool,
+    start_revision: Option<i64>,
+}
+
+#[derive(Debug, Error)]
+#[error("key cannot be empty")]
+pub struct KeyIsEmpty;
+
+impl WatchConfig {
+    fn with_key_and_range_end(key: Key, range_end: Key) -> Self {
+        Self {
+            key,
+            range_end,
+            events: WatchEvents::all(),
+            prev_kv: false,
+            start_revision: None,
+        }
+    }
+
+    /// Watches a singular key.
+    pub fn for_single_key(key: Key) -> Self {
+        Self::with_key_and_range_end(key, Key::empty())
+    }
+
+    /// Watches all keys with the given prefix.
+    ///
+    /// Note: The key must be non-empty or an error is returned. If you want to watch all keys, use the
+    /// [`Self::for_all_keys`] method instead.
+    pub fn for_keys_with_prefix(prefix: Key) -> Result<Self, KeyIsEmpty> {
+        let range_end = Key::from(range_end_for_prefix(prefix.as_slice().ok_or(KeyIsEmpty)?));
+        Ok(Self::with_key_and_range_end(prefix, range_end))
+    }
+
+    /// Watches all keys on the server.
+    ///
+    /// Note: Depending on the data in your etcd server, this can be a very busy watcher, so use with caution.
+    pub fn for_all_keys() -> Self {
+        let null_key = Key::from(vec![0]);
+        Self::with_key_and_range_end(null_key.clone(), null_key)
+    }
+
+    /// Watches keys that are greater than or equal to the provided `key`.
+    pub fn for_keys_greater_than_or_equal_to(key: Key) -> Self {
+        Self::with_key_and_range_end(key, Key::from(vec![0]))
+    }
+
+    pub fn with_start_revision(mut self, revision: i64) -> Self {
+        self.start_revision = Some(revision);
+        self
+    }
+
+    pub fn with_events(mut self, events: WatchEvents) -> Self {
+        self.events = events;
+        self
+    }
+
+    pub fn with_prev_kv(mut self, prev_kv: bool) -> Self {
+        self.prev_kv = prev_kv;
+        self
+    }
+
+    pub fn key(&self) -> &Key {
+        &self.key
     }
 }
 
@@ -164,16 +277,15 @@ impl WatcherFsm {
     ///
     /// The watcher starts out as unsynced, and will progress towards sync as the connecion managing this
     /// fsm progresses.
-    pub(crate) fn add_watcher(&mut self, key: Key, revision: i64) -> WatchId {
+    pub(crate) fn add_watcher(&mut self, config: WatchConfig) -> WatchId {
         let id = self.next_id;
         self.next_id = id.next();
         self.states.insert(
             id,
             WatcherState {
-                key,
-                sync_state: WatcherSyncState::Unsynced,
-                revision,
                 id,
+                config,
+                sync_state: WatcherSyncState::Unsynced,
             },
         );
         self.unsynced_watchers.push_back(id);
@@ -204,7 +316,7 @@ impl WatcherFsm {
         self.pending_cancels.pop_front().map(|w| w.cancel_request())
     }
 
-    pub(crate) fn cancel_watcher(&mut self, watch_id: WatchId) -> Option<Key> {
+    pub(crate) fn cancel_watcher(&mut self, watch_id: WatchId) -> Option<WatchConfig> {
         self.cancel_watcher_with_source(watch_id, CancelSource::Client)
     }
 
@@ -213,9 +325,9 @@ impl WatcherFsm {
         &mut self,
         id: WatchId,
         cancel_source: CancelSource,
-    ) -> Option<Key> {
+    ) -> Option<WatchConfig> {
         let WatcherState {
-            key, sync_state, ..
+            config, sync_state, ..
         } = self.states.remove(&id)?;
 
         self.fragmented_responses.remove(&id);
@@ -233,7 +345,7 @@ impl WatcherFsm {
             CancelSource::Server => {}
         }
 
-        Some(key)
+        Some(config)
     }
 
     fn apply_to_state_container(
@@ -263,7 +375,7 @@ impl WatcherFsm {
         let prev_sync_state = state.sync_state;
         let updatable_state = UpdatableWatcherState {
             sync_state: &mut state.sync_state,
-            revision: &mut state.revision,
+            start_revision: &mut state.config.start_revision,
         };
         let result = f(updatable_state);
         let next_sync_state = state.sync_state;
@@ -372,13 +484,13 @@ impl WatcherFsm {
             let response = self.update_watcher(watch_id, |mut s| {
                 if response.compact_revision != 0 {
                     tracing::warn!(
-                        "when trying to sync watcher {:?} at revision {}, etcd server returned a compact revision of
+                        "when trying to sync watcher {:?} at revision {:?}, etcd server returned a compact revision of
                         {}, restarting watcher at compact revision.",
-                        watch_id, s.revision, response.compact_revision
+                        watch_id, s.start_revision, response.compact_revision
                     );
                     *s.sync_state = WatcherSyncState::Unsynced;
                     // fixme: log compact revision properly, we need to re-fetch the entire key potentially?
-                    *s.revision = response.compact_revision;
+                    *s.start_revision = Some(response.compact_revision);
                     return ProcessedWatchResponse::CompactRevision { revision: response.compact_revision };
                 }
 
@@ -392,7 +504,7 @@ impl WatcherFsm {
                     tracing::info!("watcher {:?} synced", watch_id);
                     *s.sync_state = WatcherSyncState::Synced;
                 } else {
-                    *s.revision = revision;
+                    *s.start_revision = Some(revision + 1);
                 }
 
                 if response.is_progress_notify() {

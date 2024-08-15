@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use futures::FutureExt;
+use futures::{future::BoxFuture, FutureExt};
 use tokio::{
     sync::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
@@ -178,7 +178,7 @@ impl LeaseHandle {
 
     /// Returns the lease id, or None if the lease has expired.
     pub fn id(&self) -> Option<LeaseId> {
-        self.inner.notify.is_revoked().then_some(self.inner.id)
+        (!self.inner.notify.is_revoked()).then_some(self.inner.id)
     }
 
     /// Monitors the lease, returning if the lease for whatever reason was revoked or expired by the server
@@ -194,13 +194,10 @@ impl LeaseHandle {
     }
 }
 
-// fixme: dedupe?
-type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-
 enum LeaseStreamState {
     Disconnected,
     Connecting {
-        connecting: BoxFuture<Result<Response<Streaming<LeaseKeepAliveResponse>>, Status>>,
+        connecting: BoxFuture<'static, Result<Response<Streaming<LeaseKeepAliveResponse>>, Status>>,
         out: UnboundedSender<LeaseKeepAliveRequest>,
     },
     Reconnecting(Pin<Box<Sleep>>),
