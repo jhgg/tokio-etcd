@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    future::{pending, Future},
+    future::pending,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -141,7 +141,7 @@ impl LeaseWorkerHandle {
     }
 }
 
-pub enum LeaseWorkerMessage {
+pub(crate) enum LeaseWorkerMessage {
     KeepAliveLease {
         id: LeaseId,
         drop_guard: LeaseRevokedNotifyDropGuard,

@@ -28,14 +28,14 @@ fn spawn_watcher_task(
     client: &Client,
     key: impl Into<String>,
 ) -> JoinHandle<Result<(), WatchError>> {
-    let watcher = client.watcher();
+    let handle = client.watcher();
     let key = Key::from(key.into());
 
     tokio::task::spawn(async move {
         let CoalescedWatch {
             value,
             mut receiver,
-        } = watcher.watch_key_coalesced(key).await?;
+        } = handle.watch_key_coalesced(key).await?;
 
         println!("{i}: watch state: {value:?}");
 
@@ -54,9 +54,9 @@ fn spawn_watcher_task(
 }
 
 fn spawn_watch_all(client: &Client) -> JoinHandle<Result<(), WatchError>> {
-    let watcher = client.watcher();
+    let handle = client.watcher();
     tokio::task::spawn(async move {
-        let mut receiver = watcher.watch_with_config(WatchConfig::for_all_keys()).await;
+        let mut receiver = handle.watch_with_config(WatchConfig::for_all_keys()).await;
 
         loop {
             dbg!(receiver.recv().await);

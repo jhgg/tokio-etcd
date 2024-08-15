@@ -5,19 +5,19 @@ use tokio::{
     sync::mpsc::{unbounded_channel, UnboundedSender},
     time::Sleep,
 };
-use tokio_etcd_grpc_client::{AuthedChannel, WatchClient, WatchRequest, WatchResponse};
+use tokio_etcd_grpc_client::{self as pb};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Response, Status, Streaming};
 
 use crate::{utils::backoff::ExponentialBackoff, WatchId};
 
 use super::{
-    fsm::{ProcessedWatchResponse, WatcherFsm},
-    Key, WatchConfig,
+    fsm::{WatchResponse, WatcherFsm},
+    WatchConfig,
 };
 
 pub(crate) struct WatcherFsmClient {
-    watch_client: WatchClient<AuthedChannel>,
+    watch_client: pb::WatchClient<pb::AuthedChannel>,
     connection_state: ConnectionState,
     watcher_fsm: WatcherFsm,
     connection_incarnation: u64,
@@ -25,7 +25,10 @@ pub(crate) struct WatcherFsmClient {
 }
 
 impl WatcherFsmClient {
-    pub fn new(watch_client: WatchClient<AuthedChannel>, concurrent_sync_limit: usize) -> Self {
+    pub fn new(
+        watch_client: pb::WatchClient<pb::AuthedChannel>,
+        concurrent_sync_limit: usize,
+    ) -> Self {
         Self {
             watch_client,
             watcher_fsm: WatcherFsm::new(concurrent_sync_limit),
@@ -46,7 +49,7 @@ impl WatcherFsmClient {
         let config = self.do_fsm_action(|fsm| fsm.cancel_watcher(watch_id))?;
         tracing::info!(
             "cancelled watcher, key: {:?}, watch_id: {:?}",
-            config.key(),
+            config.key,
             watch_id
         );
 
@@ -56,7 +59,7 @@ impl WatcherFsmClient {
     /// This future is cancel safe.
     ///
     /// Progresses the connection forward.
-    pub async fn next(&mut self) -> (WatchId, ProcessedWatchResponse) {
+    pub async fn next(&mut self) -> (WatchId, WatchResponse) {
         loop {
             match &mut self.connection_state {
                 // When we're disconnected, we'll just stay pending forever, as we'll expect this
@@ -186,8 +189,8 @@ enum ConnectionState {
         BoxFuture<
             'static,
             (
-                Result<Response<Streaming<WatchResponse>>, Status>,
-                UnboundedSender<WatchRequest>,
+                Result<Response<Streaming<pb::WatchResponse>>, Status>,
+                UnboundedSender<pb::WatchRequest>,
             ),
         >,
     ),
@@ -209,8 +212,8 @@ impl ConnectionState {
 }
 
 struct ConnectedWatcherStream {
-    stream: Streaming<WatchResponse>,
-    sender: UnboundedSender<WatchRequest>,
+    stream: Streaming<pb::WatchResponse>,
+    sender: UnboundedSender<pb::WatchRequest>,
 }
 
 #[derive(Debug)]
@@ -220,15 +223,18 @@ enum DisconnectReason {
 }
 
 impl ConnectedWatcherStream {
-    fn new(stream: Streaming<WatchResponse>, sender: UnboundedSender<WatchRequest>) -> Self {
+    fn new(
+        stream: Streaming<pb::WatchResponse>,
+        sender: UnboundedSender<pb::WatchRequest>,
+    ) -> Self {
         ConnectedWatcherStream { stream, sender }
     }
 
-    fn send(&mut self, request: WatchRequest) {
+    fn send(&mut self, request: pb::WatchRequest) {
         self.sender.send(request).ok();
     }
 
-    async fn next_message(&mut self) -> Result<WatchResponse, DisconnectReason> {
+    async fn next_message(&mut self) -> Result<pb::WatchResponse, DisconnectReason> {
         loop {
             let message = tokio::select! {
                 message = self.stream.message() => message,

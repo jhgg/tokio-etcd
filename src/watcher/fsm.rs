@@ -4,12 +4,9 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio_etcd_grpc_client::{
-    watch_create_request::FilterType, watch_request, Event, EventType, KeyValue, WatchRequest,
-    WatchResponse,
-};
+use tokio_etcd_grpc_client::{self as pb};
 
-use super::{util::range_end_for_prefix, Key, WatchConfig};
+use super::WatchConfig;
 use crate::{ids::IdFastHasherBuilder, LeaseId, WatchId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,7 +67,7 @@ pub enum WatcherValue {
 }
 
 impl WatcherValue {
-    pub(crate) fn from_kv(kv: KeyValue) -> Self {
+    pub(crate) fn from_kv(kv: pb::KeyValue) -> Self {
         Self::Set {
             value: kv.value.into(),
             mod_revision: kv.mod_revision as _,
@@ -82,7 +79,7 @@ impl WatcherValue {
 }
 
 impl UpdatableWatcherState<'_> {
-    fn handle_event(&mut self, event: Event) -> WatcherEvent {
+    fn handle_event(&mut self, event: pb::Event) -> WatcherEvent {
         let event_type = event.r#type();
         let kv = event.kv.expect("invariant: kv is always present");
         let prev_kv = event.prev_kv;
@@ -93,14 +90,14 @@ impl UpdatableWatcherState<'_> {
         WatcherEvent {
             key: kv.key.into(),
             value: match event_type {
-                EventType::Put => WatcherValue::Set {
+                pb::EventType::Put => WatcherValue::Set {
                     value: kv.value.into(),
                     mod_revision: kv.mod_revision as _,
                     create_revision: kv.create_revision as _,
                     version: kv.version as _,
                     lease_id: LeaseId::new(kv.lease),
                 },
-                EventType::Delete => WatcherValue::Unset {
+                pb::EventType::Delete => WatcherValue::Unset {
                     mod_revision: Some(kv.mod_revision),
                 },
             },
@@ -119,19 +116,27 @@ impl UpdatableWatcherState<'_> {
 }
 
 impl WatcherState {
-    fn initial_watch_request(&self) -> WatchRequest {
-        WatchRequest {
-            request_union: Some(watch_request::RequestUnion::CreateRequest(
+    fn initial_watch_request(&self) -> pb::WatchRequest {
+        let WatchConfig {
+            events,
+            key,
+            prev_kv,
+            range_end,
+            start_revision,
+        } = &self.config;
+
+        pb::WatchRequest {
+            request_union: Some(pb::watch_request::RequestUnion::CreateRequest(
                 tokio_etcd_grpc_client::WatchCreateRequest {
                     watch_id: self.id.get() as _,
                     fragment: true,
                     progress_notify: true,
                     // configured values:
-                    key: self.config.key.as_vec(),
-                    range_end: self.config.range_end.as_vec(),
-                    start_revision: self.config.start_revision.unwrap_or_default(),
-                    filters: self.config.events.for_filters_proto(),
-                    prev_kv: self.config.prev_kv,
+                    key: key.as_vec(),
+                    range_end: range_end.as_ref().map(|x| x.as_vec()).unwrap_or_default(),
+                    start_revision: start_revision.unwrap_or_default(),
+                    filters: events.for_filters_proto(),
+                    prev_kv: *prev_kv,
                 },
             )),
         }
@@ -140,12 +145,11 @@ impl WatcherState {
 
 pub(crate) struct WatcherFsm {
     next_id: WatchId,
-    // fixme: move this out of watcher map and into the worker.
     states: HashMap<WatchId, WatcherState, IdFastHasherBuilder>,
     unsynced_watchers: VecDeque<WatchId>,
     syncing_watchers: VecDeque<WatchId>,
     pending_cancels: VecDeque<WatchId>,
-    fragmented_responses: HashMap<WatchId, WatchResponse, IdFastHasherBuilder>,
+    fragmented_responses: HashMap<WatchId, pb::WatchResponse, IdFastHasherBuilder>,
     concurrent_sync_limit: usize,
 }
 
@@ -196,7 +200,7 @@ impl WatcherFsm {
     /// watchers depending on config.
     ///
     /// Otherwise, it will send cancel requests for watchers that have been cancelled.
-    pub(crate) fn next_watch_request_to_send(&mut self) -> Option<WatchRequest> {
+    pub(crate) fn next_watch_request_to_send(&mut self) -> Option<pb::WatchRequest> {
         // If we have watchers that are unsynced, we'll try to sync them first.
         if self.syncing_watchers.len() < self.concurrent_sync_limit {
             if let Some(&unsynced_id) = self.unsynced_watchers.front() {
@@ -319,7 +323,10 @@ impl WatcherFsm {
     /// Returns:
     ///  - Some(WatchResponse): if the response was a complete response, and we've merged all the fragments.
     ///  - None: if the response was a fragment, and we're waiting for more fragments.
-    fn try_merge_fragmented_response(&mut self, response: WatchResponse) -> Option<WatchResponse> {
+    fn try_merge_fragmented_response(
+        &mut self,
+        response: pb::WatchResponse,
+    ) -> Option<pb::WatchResponse> {
         let watch_id = WatchId(response.watch_id as _);
 
         match (self.fragmented_responses.entry(watch_id), response.fragment) {
@@ -350,8 +357,8 @@ impl WatcherFsm {
     /// Progresses the finite state machine forward.
     pub(crate) fn process_watch_response(
         &mut self,
-        response: WatchResponse,
-    ) -> Option<(WatchId, ProcessedWatchResponse)> {
+        response: pb::WatchResponse,
+    ) -> Option<(WatchId, WatchResponse)> {
         let watch_id = WatchId(response.watch_id as _);
 
         // There is a chance that we may receive a watch response for a watcher we already don't care about.
@@ -374,7 +381,7 @@ impl WatcherFsm {
 
             Some((
                 watch_id,
-                ProcessedWatchResponse::Cancelled(WatchCancelledByServer {
+                WatchResponse::Cancelled(WatchCancelledByServer {
                     reason: response.cancel_reason.into(),
                 }),
             ))
@@ -389,7 +396,7 @@ impl WatcherFsm {
                     *s.sync_state = WatcherSyncState::Unsynced;
                     // fixme: log compact revision properly, we need to re-fetch the entire key potentially?
                     *s.start_revision = Some(response.compact_revision);
-                    return ProcessedWatchResponse::CompactRevision { revision: response.compact_revision };
+                    return WatchResponse::CompactRevision { revision: response.compact_revision };
                 }
 
                 let revision = response
@@ -406,7 +413,7 @@ impl WatcherFsm {
                 }
 
                 if response.is_progress_notify() {
-                    return ProcessedWatchResponse::Progress { revision };
+                    return WatchResponse::Progress { revision };
                 }
 
                 let mut events = Vec::with_capacity(response.events.len());
@@ -414,7 +421,7 @@ impl WatcherFsm {
                     events.push(s.handle_event(event));
                 }
 
-                ProcessedWatchResponse::Events { events, revision }
+                WatchResponse::Events { events, revision }
             })?;
 
             Some((watch_id, response))
@@ -430,7 +437,7 @@ enum CancelSource {
 }
 
 #[derive(Debug)]
-pub enum ProcessedWatchResponse {
+pub enum WatchResponse {
     /// The watcher was cancelled by the server.
     Cancelled(WatchCancelledByServer),
     /// The watcher emitted the following events.
@@ -444,7 +451,7 @@ pub enum ProcessedWatchResponse {
     CompactRevision { revision: i64 },
 }
 
-impl ProcessedWatchResponse {
+impl WatchResponse {
     /// Returns `true` if the processed watch response is [`Cancelled`].
     ///
     /// [`Cancelled`]: ProcessedWatchResponse::Cancelled
@@ -465,9 +472,9 @@ impl WatchId {
         WatchId(self.0 + 1)
     }
 
-    fn cancel_request(&self) -> WatchRequest {
-        WatchRequest {
-            request_union: Some(watch_request::RequestUnion::CancelRequest(
+    fn cancel_request(&self) -> pb::WatchRequest {
+        pb::WatchRequest {
+            request_union: Some(pb::watch_request::RequestUnion::CancelRequest(
                 tokio_etcd_grpc_client::WatchCancelRequest {
                     watch_id: self.get() as _,
                 },

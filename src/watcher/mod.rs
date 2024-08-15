@@ -7,7 +7,7 @@ use std::{
     panic,
 };
 
-use fsm::{ProcessedWatchResponse, WatchCancelledByServer, WatcherEvent, WatcherValue};
+use fsm::{WatchCancelledByServer, WatchResponse, WatcherValue};
 use fsm_client::WatcherFsmClient;
 use thiserror::Error;
 use tokio::{
@@ -17,10 +17,7 @@ use tokio::{
     },
     task::JoinSet,
 };
-use tokio_etcd_grpc_client::{
-    watch_create_request::FilterType, AuthedChannel, KvClient, RangeRequest, RangeResponse,
-    WatchClient,
-};
+use tokio_etcd_grpc_client::{self as pb};
 use tonic::{Response, Status};
 use util::range_end_for_prefix;
 
@@ -38,20 +35,20 @@ use crate::{ids::IdFastHasherBuilder, WatchId};
 ///   re-syncs are as efficient as possible.
 /// - Handling watch cancellations, both from the client and the server.
 pub struct WatcherHandle {
-    tx: UnboundedSender<WorkerMessage>,
+    sender: UnboundedSender<WorkerMessage>,
 }
 
 impl WatcherHandle {
     pub(crate) fn new(
-        watch_client: WatchClient<AuthedChannel>,
-        kv_client: KvClient<AuthedChannel>,
+        watch_client: pb::WatchClient<pb::AuthedChannel>,
+        kv_client: pb::KvClient<pb::AuthedChannel>,
     ) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
 
-        let worker = WatcherWorker::new(rx, tx.downgrade(), watch_client, kv_client);
+        let worker = WatcherWorker::new(receiver, sender.downgrade(), watch_client, kv_client);
         tokio::spawn(worker.run());
 
-        WatcherHandle { tx }
+        WatcherHandle { sender }
     }
 
     /// Watches a key in etcd, returning the latest value of the key, and a receiver that can be used to receive
@@ -64,32 +61,34 @@ impl WatcherHandle {
         &self,
         key: impl Into<Key>,
     ) -> Result<CoalescedWatch, WatchError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.tx
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.sender
             .send(WorkerMessage::CoalescedWatchKey {
                 key: key.into(),
-                sender: tx,
+                sender,
             })
             .ok();
 
-        // fixme: ???
-        rx.await.expect("invariant: worker always sends a response")
+        receiver
+            .await
+            .expect("invariant: worker has unexpectedly shutdown")
     }
 
     /// Watches a key in etcd, using the given [`WatchConfig`].
     ///
     /// The watcher will be automatically cancelled when the returned [`ForwardedWatchReceiver`] is dropped.
     pub async fn watch_with_config(&self, watch_config: WatchConfig) -> ForwardedWatchReceiver {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.tx
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.sender
             .send(WorkerMessage::WatchAndForward {
                 watch_config,
-                sender: tx,
+                sender,
             })
             .ok();
 
-        // fixme: ???
-        rx.await.expect("invariant: worker always sends a response")
+        receiver
+            .await
+            .expect("invariant: worker has unexpectedly shutdown")
     }
 }
 
@@ -206,12 +205,12 @@ impl CoalescedWatcherReceiver {
 }
 
 pub struct ForwardedWatchReceiver {
-    state: ReceiverState<UnboundedReceiver<ProcessedWatchResponse>>,
+    state: ReceiverState<UnboundedReceiver<WatchResponse>>,
 }
 
 impl ForwardedWatchReceiver {
     fn new(
-        receiver: UnboundedReceiver<ProcessedWatchResponse>,
+        receiver: UnboundedReceiver<WatchResponse>,
         tx: UnboundedSender<WorkerMessage>,
         id: WatchId,
     ) -> Self {
@@ -223,16 +222,16 @@ impl ForwardedWatchReceiver {
         }
     }
 
-    pub async fn recv(&mut self) -> ProcessedWatchResponse {
+    pub async fn recv(&mut self) -> WatchResponse {
         match &mut self.state {
             ReceiverState::Active {
                 receiver,
                 drop_guard,
             } => match receiver.recv().await {
-                Some(ProcessedWatchResponse::Cancelled(reason)) => {
+                Some(WatchResponse::Cancelled(reason)) => {
                     drop_guard.disarm();
                     self.state = ReceiverState::Cancelled(reason.clone());
-                    ProcessedWatchResponse::Cancelled(reason)
+                    WatchResponse::Cancelled(reason)
                 }
                 Some(response) => response,
                 None => {
@@ -240,10 +239,10 @@ impl ForwardedWatchReceiver {
                         reason: "watcher receiver closed".into(),
                     };
                     self.state = ReceiverState::Cancelled(reason.clone());
-                    ProcessedWatchResponse::Cancelled(reason)
+                    WatchResponse::Cancelled(reason)
                 }
             },
-            ReceiverState::Cancelled(reason) => ProcessedWatchResponse::Cancelled(reason.clone()),
+            ReceiverState::Cancelled(reason) => WatchResponse::Cancelled(reason.clone()),
         }
     }
 }
@@ -258,115 +257,101 @@ type InitialCoalescedWatchSender = tokio::sync::oneshot::Sender<Result<Coalesced
 type InitialForwardedWatchSender = tokio::sync::oneshot::Sender<ForwardedWatchReceiver>;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Key(Option<Box<[u8]>>);
+pub struct Key(Box<[u8]>);
 
 impl From<String> for Key {
     fn from(value: String) -> Self {
-        Self::new(value.into_bytes())
+        Self(value.into_bytes().into())
     }
 }
 
 impl From<Vec<u8>> for Key {
     fn from(value: Vec<u8>) -> Self {
-        Self::new(value)
+        Self(value.into())
     }
 }
 
 impl From<Box<[u8]>> for Key {
     fn from(value: Box<[u8]>) -> Self {
-        Self(Some(value))
+        Self(value)
     }
 }
 
 impl From<&str> for Key {
     fn from(value: &str) -> Self {
-        Self::new(value.as_bytes().to_owned())
+        Self(value.as_bytes().to_owned().into())
+    }
+}
+
+impl From<&[u8]> for Key {
+    fn from(value: &[u8]) -> Self {
+        Self(value.into())
     }
 }
 
 impl Key {
-    fn make_range_request(&self) -> RangeRequest {
-        RangeRequest {
-            key: match self.0.clone() {
-                Some(x) => x.into_vec(),
-                None => Vec::new(),
-            },
+    // fixme: this really should not be on `Key`
+    fn make_range_request(&self) -> pb::RangeRequest {
+        pb::RangeRequest {
+            key: self.as_vec(),
             ..Default::default()
         }
     }
 
-    fn new(key: impl Into<Box<[u8]>>) -> Self {
-        Self(Some(key.into()))
-    }
-
     fn as_vec(&self) -> Vec<u8> {
-        match &self.0 {
-            Some(data) => data.clone().into_vec(),
-            None => Vec::new(),
-        }
+        self.0.clone().into_vec()
     }
 
-    fn as_slice(&self) -> Option<&[u8]> {
-        match &self.0 {
-            Some(data) => Some(&data),
-            None => None,
-        }
-    }
-
-    fn into_vec(self) -> Vec<u8> {
-        match self.0 {
-            Some(data) => data.into_vec(),
-            None => Vec::new(),
-        }
-    }
-
-    pub fn empty() -> Key {
-        Self(None)
+    fn as_slice(&self) -> &[u8] {
+        &self.0
     }
 }
 
 struct KeyWatchState {
     id: WatchId,
-    watch_type: KeyWatchType,
+    watch_kind: WatchKind,
 }
 impl KeyWatchState {
-    fn send_response(&mut self, response: ProcessedWatchResponse) {
-        match &mut self.watch_type {
-            KeyWatchType::CoalescedKey { value, sender, .. } => {
-                if let ProcessedWatchResponse::Events { events, .. } = response {
+    fn send_response(&mut self, response: WatchResponse) -> bool {
+        let is_cancelled = response.is_cancelled();
+
+        match &mut self.watch_kind {
+            WatchKind::CoalescedKey { value, sender, .. } => {
+                if let WatchResponse::Events { events, .. } = response {
                     for event in events {
                         *value = event.value;
                         sender.send(Ok(value.clone())).ok();
                     }
                 }
             }
-            KeyWatchType::ForwardEvents { sender } => {
+            WatchKind::ForwardWatchResponses { sender } => {
                 sender.send(response).ok();
             }
+        }
+
+        !is_cancelled
+    }
+
+    fn has_no_receiver(&self) -> bool {
+        match &self.watch_kind {
+            WatchKind::CoalescedKey { sender, .. } => sender.receiver_count() == 0,
+            WatchKind::ForwardWatchResponses { sender } => sender.is_closed(),
         }
     }
 }
 
-// fixme: better naming
-enum KeyWatchType {
+enum WatchKind {
     CoalescedKey {
         key: Key,
         value: WatcherValue,
         sender: broadcast::Sender<Result<WatcherValue, WatchCancelledByServer>>,
     },
-    ForwardEvents {
-        sender: mpsc::UnboundedSender<ProcessedWatchResponse>,
+    ForwardWatchResponses {
+        sender: mpsc::UnboundedSender<WatchResponse>,
     },
 }
 
-impl KeyWatchType {
-    fn has_no_receiver(&self) -> bool {
-        match &self {
-            KeyWatchType::CoalescedKey { sender, .. } => sender.receiver_count() == 0,
-            KeyWatchType::ForwardEvents { sender } => sender.is_closed(),
-        }
-    }
-}
+impl WatchKind {}
 
 #[derive(Default)]
 struct WatchedSet {
@@ -388,26 +373,21 @@ impl WatchedSet {
         Some(&self.states[watch_id])
     }
 
-    fn update_from_watch_response(&mut self, id: WatchId, response: ProcessedWatchResponse) {
-        let Some(state) = self.states.get_mut(&id) else {
-            return;
-        };
-
-        let is_cancelled = response.is_cancelled();
-        state.send_response(response);
-
-        if is_cancelled {
-            self.remove(id);
+    fn update_from_watch_response(&mut self, id: WatchId, response: WatchResponse) {
+        if let Some(state) = self.states.get_mut(&id) {
+            if !state.send_response(response) {
+                self.remove(id);
+            }
         }
     }
 
     fn insert(
         &mut self,
         id: WatchId,
-        watch_type: KeyWatchType,
+        watch_kind: WatchKind,
     ) -> Result<&KeyWatchState, InsertError> {
-        match watch_type {
-            KeyWatchType::CoalescedKey { key, value, sender } => {
+        match watch_kind {
+            WatchKind::CoalescedKey { key, value, sender } => {
                 let vacant_key = match self.coalesced_keys.entry(key) {
                     Entry::Occupied(ent) => {
                         return Err(InsertError::KeyAlreadyExists {
@@ -426,10 +406,10 @@ impl WatchedSet {
                 vacant_key.insert(id);
                 Ok(vacant_watch_id.insert(KeyWatchState {
                     id,
-                    watch_type: KeyWatchType::CoalescedKey { key, value, sender },
+                    watch_kind: WatchKind::CoalescedKey { key, value, sender },
                 }))
             }
-            KeyWatchType::ForwardEvents { sender } => {
+            WatchKind::ForwardWatchResponses { sender } => {
                 let vacant_watch_id = match self.states.entry(id) {
                     Entry::Occupied(_) => return Err(InsertError::WatchIdAlreadyExists),
                     Entry::Vacant(ent) => ent,
@@ -437,7 +417,7 @@ impl WatchedSet {
 
                 Ok(vacant_watch_id.insert(KeyWatchState {
                     id,
-                    watch_type: KeyWatchType::ForwardEvents { sender },
+                    watch_kind: WatchKind::ForwardWatchResponses { sender },
                 }))
             }
         }
@@ -445,7 +425,7 @@ impl WatchedSet {
 
     fn remove(&mut self, id: WatchId) -> Option<KeyWatchState> {
         let state = self.states.remove(&id)?;
-        if let KeyWatchType::CoalescedKey { key, .. } = &state.watch_type {
+        if let WatchKind::CoalescedKey { key, .. } = &state.watch_kind {
             let removed_id = self
                 .coalesced_keys
                 .remove(&key)
@@ -457,27 +437,27 @@ impl WatchedSet {
     }
 
     fn cancel_watcher_if_no_receiver(&mut self, id: WatchId) -> bool {
-        let has_no_receiver = if let Some(KeyWatchState { watch_type, .. }) = self.states.get(&id) {
-            watch_type.has_no_receiver()
-        } else {
-            false
+        let has_no_receiver = match self.states.get(&id) {
+            Some(state) => state.has_no_receiver(),
+            None => false,
         };
 
         if has_no_receiver {
             self.remove(id);
         }
+
         has_no_receiver
     }
 }
 
 struct WatcherWorker {
-    rx: UnboundedReceiver<WorkerMessage>,
-    weak_tx: WeakUnboundedSender<WorkerMessage>,
+    receiver: UnboundedReceiver<WorkerMessage>,
+    weak_sender: WeakUnboundedSender<WorkerMessage>,
     in_progress_reads: HashMap<Key, Vec<InitialCoalescedWatchSender>>,
     watcher_fsm_client: WatcherFsmClient,
     watched: WatchedSet,
-    kv_client: KvClient<AuthedChannel>,
-    range_request_join_set: JoinSet<(Key, Result<Response<RangeResponse>, Status>)>,
+    kv_client: pb::KvClient<pb::AuthedChannel>,
+    range_request_join_set: JoinSet<(Key, Result<Response<pb::RangeResponse>, Status>)>,
 }
 
 impl WatcherWorker {
@@ -485,14 +465,14 @@ impl WatcherWorker {
     const BROADCAST_CHANNEL_CAPACITY: usize = 16;
 
     fn new(
-        rx: UnboundedReceiver<WorkerMessage>,
-        weak_tx: WeakUnboundedSender<WorkerMessage>,
-        watch_client: WatchClient<AuthedChannel>,
-        kv_client: KvClient<AuthedChannel>,
+        receiver: UnboundedReceiver<WorkerMessage>,
+        weak_sender: WeakUnboundedSender<WorkerMessage>,
+        watch_client: pb::WatchClient<pb::AuthedChannel>,
+        kv_client: pb::KvClient<pb::AuthedChannel>,
     ) -> Self {
         Self {
-            rx,
-            weak_tx,
+            receiver,
+            weak_sender,
             kv_client,
             in_progress_reads: Default::default(),
             watched: Default::default(),
@@ -505,12 +485,12 @@ impl WatcherWorker {
         loop {
             enum Action {
                 WorkerMessage(WorkerMessage),
-                ReadResult(Key, Result<Response<RangeResponse>, Status>),
-                WatchResponse(WatchId, ProcessedWatchResponse),
+                ReadResult(Key, Result<Response<pb::RangeResponse>, Status>),
+                WatchResponse(WatchId, WatchResponse),
             }
 
             let action = tokio::select! {
-                message = self.rx.recv() => {
+                message = self.receiver.recv() => {
                     if let Some(message) = message {
                         Action::WorkerMessage(message)
                     } else {
@@ -564,7 +544,7 @@ impl WatcherWorker {
         }
     }
 
-    fn handle_read_result(&mut self, key: Key, value: Result<Response<RangeResponse>, Status>) {
+    fn handle_read_result(&mut self, key: Key, value: Result<Response<pb::RangeResponse>, Status>) {
         let Some(senders) = self.in_progress_reads.remove(&key) else {
             tracing::warn!(
                 "received read result for key that isn't in progress: {key:?}. ignoring result"
@@ -572,7 +552,7 @@ impl WatcherWorker {
             return;
         };
 
-        let Some(tx) = self.weak_tx.upgrade() else {
+        let Some(tx) = self.weak_sender.upgrade() else {
             return;
         };
 
@@ -601,7 +581,7 @@ impl WatcherWorker {
                         .watched
                         .insert(
                             id,
-                            KeyWatchType::CoalescedKey {
+                            WatchKind::CoalescedKey {
                                 key,
                                 value: value.clone(),
                                 sender,
@@ -644,7 +624,7 @@ impl WatcherWorker {
         }
     }
 
-    fn handle_watch_response(&mut self, id: WatchId, response: ProcessedWatchResponse) {
+    fn handle_watch_response(&mut self, id: WatchId, response: WatchResponse) {
         self.watched.update_from_watch_response(id, response);
     }
 
@@ -656,17 +636,17 @@ impl WatcherWorker {
 
         // We should be able to upgrade if there is a handle to the worker which sent us this request. If not,
         // there's no worker handle, so we'll just return.
-        let Some(tx) = self.weak_tx.upgrade() else {
+        let Some(tx) = self.weak_sender.upgrade() else {
             return;
         };
 
         // Check to see if we're already watching that key, so we can duplicate the watcher:
         if let Some(state) = self.watched.get_watch_state_by_key(&key) {
-            let (value, receiver) = match &state.watch_type {
-                KeyWatchType::CoalescedKey { value, sender, .. } => {
+            let (value, receiver) = match &state.watch_kind {
+                WatchKind::CoalescedKey { value, sender, .. } => {
                     (value.clone(), sender.subscribe())
                 }
-                KeyWatchType::ForwardEvents { sender } => {
+                WatchKind::ForwardWatchResponses { .. } => {
                     unreachable!("unreachable: we should only have coalesced key watchers")
                 }
             };
@@ -706,14 +686,14 @@ impl WatcherWorker {
     ) {
         // We should be able to upgrade if there is a handle to the worker which sent us this request. If not,
         // there's no worker handle, so we'll just return.
-        let Some(tx) = self.weak_tx.upgrade() else {
+        let Some(tx) = self.weak_sender.upgrade() else {
             return;
         };
 
         let id = self.watcher_fsm_client.add_watcher(watch_config);
         let (sender, receiver) = unbounded_channel();
         self.watched
-            .insert(id, KeyWatchType::ForwardEvents { sender })
+            .insert(id, WatchKind::ForwardWatchResponses { sender })
             .expect("invariant: insert should always succeed");
 
         initial_sender
@@ -722,20 +702,17 @@ impl WatcherWorker {
     }
 }
 
+/// Configuration that is used with [`WatcherHandle::watch_with_config`].
 pub struct WatchConfig {
     key: Key,
-    range_end: Key,
+    range_end: Option<Key>,
     events: WatchEvents,
     prev_kv: bool,
     start_revision: Option<i64>,
 }
 
-#[derive(Debug, Error)]
-#[error("key cannot be empty")]
-pub struct KeyIsEmpty;
-
 impl WatchConfig {
-    fn with_key_and_range_end(key: Key, range_end: Key) -> Self {
+    fn with_key_and_range_end(key: Key, range_end: Option<Key>) -> Self {
         Self {
             key,
             range_end,
@@ -746,49 +723,57 @@ impl WatchConfig {
     }
 
     /// Watches a singular key.
+    ///
+    /// Generally, you should prefer to use [`WatcherHandle::watch_key_coalesced`], unless you need to configure
+    /// the watcher additional option (see the `with_*` methods on [`WatchConfig`]).
     pub fn for_single_key(key: Key) -> Self {
-        Self::with_key_and_range_end(key, Key::empty())
+        Self::with_key_and_range_end(key, None)
     }
 
     /// Watches all keys with the given prefix.
     ///
     /// Note: The key must be non-empty or an error is returned. If you want to watch all keys, use the
     /// [`Self::for_all_keys`] method instead.
-    pub fn for_keys_with_prefix(prefix: Key) -> Result<Self, KeyIsEmpty> {
-        let range_end = Key::from(range_end_for_prefix(prefix.as_slice().ok_or(KeyIsEmpty)?));
-        Ok(Self::with_key_and_range_end(prefix, range_end))
+    pub fn for_keys_with_prefix(prefix: Key) -> Self {
+        let range_end = Key::from(range_end_for_prefix(prefix.as_slice()));
+        Self::with_key_and_range_end(prefix, Some(range_end))
     }
 
     /// Watches all keys on the server.
     ///
     /// Note: Depending on the data in your etcd server, this can be a very busy watcher, so use with caution.
     pub fn for_all_keys() -> Self {
-        let null_key = Key::from(vec![0]);
-        Self::with_key_and_range_end(null_key.clone(), null_key)
+        let null_key = Key::from(&[0][..]);
+        Self::with_key_and_range_end(null_key.clone(), Some(null_key))
     }
 
     /// Watches keys that are greater than or equal to the provided `key`.
     pub fn for_keys_greater_than_or_equal_to(key: Key) -> Self {
-        Self::with_key_and_range_end(key, Key::from(vec![0]))
+        Self::with_key_and_range_end(key, Some(Key::from(&[0][..])))
     }
 
+    /// Starts the watcher with the given revision.
+    ///
+    /// Default: starts at the latest revision at the time the watcher is received by etcd.
     pub fn with_start_revision(mut self, revision: i64) -> Self {
         self.start_revision = Some(revision);
         self
     }
 
+    /// Allows you to specify a subset of events to be received by the watcher.
+    ///
+    /// Default: all events are received.
     pub fn with_events(mut self, events: WatchEvents) -> Self {
         self.events = events;
         self
     }
 
+    /// Returns the previous value when a value is updated or deleted.
+    ///
+    /// Default: false
     pub fn with_prev_kv(mut self, prev_kv: bool) -> Self {
         self.prev_kv = prev_kv;
         self
-    }
-
-    pub fn key(&self) -> &Key {
-        &self.key
     }
 }
 
@@ -828,11 +813,11 @@ impl WatchEvents {
             Vec::with_capacity(if self.put { 0 } else { 1 } + if self.delete { 0 } else { 1 });
 
         if !self.put {
-            data.push(FilterType::Noput as i32);
+            data.push(pb::watch_create_request::FilterType::Noput as i32);
         }
 
         if !self.delete {
-            data.push(FilterType::Nodelete as i32);
+            data.push(pb::watch_create_request::FilterType::Nodelete as i32);
         }
 
         data
