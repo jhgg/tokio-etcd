@@ -1,5 +1,6 @@
 use std::{future::pending, pin::Pin, time::Duration};
 
+use futures::future::BoxFuture;
 use tokio::{
     sync::mpsc::{unbounded_channel, UnboundedSender},
     time::Sleep,
@@ -12,7 +13,7 @@ use crate::{utils::backoff::ExponentialBackoff, WatchId};
 
 use super::{
     fsm::{ProcessedWatchResponse, WatchConfig, WatcherFsm},
-    BoxFuture, Key,
+    Key,
 };
 
 pub(crate) struct WatcherFsmClient {
@@ -182,10 +183,13 @@ impl WatcherFsmClient {
 enum ConnectionState {
     Disconnected,
     Connecting(
-        BoxFuture<(
-            Result<Response<Streaming<WatchResponse>>, Status>,
-            UnboundedSender<WatchRequest>,
-        )>,
+        BoxFuture<
+            'static,
+            (
+                Result<Response<Streaming<WatchResponse>>, Status>,
+                UnboundedSender<WatchRequest>,
+            ),
+        >,
     ),
     Reconnecting(Pin<Box<Sleep>>),
     Connected(ConnectedWatcherStream),

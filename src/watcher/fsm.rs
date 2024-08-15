@@ -115,7 +115,7 @@ impl WatcherState {
                     key: self.config.key.as_vec(),
                     range_end: self.config.range_end.as_vec(),
                     start_revision: self.config.start_revision.unwrap_or_default(),
-                    filters: self.config.filters.for_proto(),
+                    filters: self.config.events.for_filters_proto(),
                     prev_kv: self.config.prev_kv,
                 },
             )),
@@ -123,13 +123,13 @@ impl WatcherState {
     }
 }
 
-pub struct WatchFilters {
+pub struct WatchEvents {
     put: bool,
     delete: bool,
 }
 
-impl WatchFilters {
-    /// Don't filter anything
+impl WatchEvents {
+    /// Watch should include all events.
     pub fn all() -> Self {
         Self {
             put: true,
@@ -153,7 +153,8 @@ impl WatchFilters {
         }
     }
 
-    fn for_proto(&self) -> Vec<i32> {
+    /// Convert this to a list of filter types for proto.
+    fn for_filters_proto(&self) -> Vec<i32> {
         let mut data =
             Vec::with_capacity(if self.put { 0 } else { 1 } + if self.delete { 0 } else { 1 });
 
@@ -172,7 +173,7 @@ impl WatchFilters {
 pub struct WatchConfig {
     key: Key,
     range_end: Key,
-    filters: WatchFilters,
+    events: WatchEvents,
     prev_kv: bool,
     start_revision: Option<i64>,
 }
@@ -186,7 +187,7 @@ impl WatchConfig {
         Self {
             key,
             range_end,
-            filters: WatchFilters::all(),
+            events: WatchEvents::all(),
             prev_kv: false,
             start_revision: None,
         }
@@ -224,8 +225,8 @@ impl WatchConfig {
         self
     }
 
-    pub fn with_filters(mut self, filters: WatchFilters) -> Self {
-        self.filters = filters;
+    pub fn with_events(mut self, events: WatchEvents) -> Self {
+        self.events = events;
         self
     }
 
