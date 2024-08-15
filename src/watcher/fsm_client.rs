@@ -39,18 +39,18 @@ impl WatcherFsmClient {
     }
 
     pub(crate) fn add_watcher(&mut self, watch_config: WatchConfig) -> WatchId {
-        let watch_id = self.do_fsm_action(|fsm| fsm.add_watcher(watch_config));
-        tracing::info!("added watcher: {:?}", watch_id);
+        let id = self.do_fsm_action(|fsm| fsm.add_watcher(watch_config));
+        tracing::info!("added watcher: {:?}", id);
 
-        watch_id
+        id
     }
 
-    pub(crate) fn cancel_watcher(&mut self, watch_id: WatchId) -> Option<WatchConfig> {
-        let config = self.do_fsm_action(|fsm| fsm.cancel_watcher(watch_id))?;
+    pub(crate) fn cancel_watcher(&mut self, id: WatchId) -> Option<WatchConfig> {
+        let config = self.do_fsm_action(|fsm| fsm.cancel_watcher(id))?;
         tracing::info!(
             "cancelled watcher, key: {:?}, watch_id: {:?}",
             config.key,
-            watch_id
+            id
         );
 
         Some(config)

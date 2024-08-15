@@ -59,7 +59,12 @@ fn spawn_watch_all(client: &Client) -> JoinHandle<Result<(), WatchError>> {
         let mut receiver = handle.watch_with_config(WatchConfig::for_all_keys()).await;
 
         loop {
-            dbg!(receiver.recv().await);
+            let response = dbg!(receiver.recv().await);
+            if response.is_cancelled() {
+                break;
+            }
         }
+
+        Ok(())
     })
 }

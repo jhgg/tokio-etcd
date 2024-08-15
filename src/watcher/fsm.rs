@@ -218,8 +218,8 @@ impl WatcherFsm {
         self.pending_cancels.pop_front().map(|w| w.cancel_request())
     }
 
-    pub(crate) fn cancel_watcher(&mut self, watch_id: WatchId) -> Option<WatchConfig> {
-        self.cancel_watcher_with_source(watch_id, CancelSource::Client)
+    pub(crate) fn cancel_watcher(&mut self, id: WatchId) -> Option<WatchConfig> {
+        self.cancel_watcher_with_source(id, CancelSource::Client)
     }
 
     /// Cancels a watcher by its watch id.
@@ -270,10 +270,10 @@ impl WatcherFsm {
     /// is moved to the correct container depending on its sync state.
     fn update_watcher<T>(
         &mut self,
-        watch_id: WatchId,
+        id: WatchId,
         f: impl FnOnce(UpdatableWatcherState) -> T,
     ) -> Option<T> {
-        let state = self.states.get_mut(&watch_id)?;
+        let state = self.states.get_mut(&id)?;
         let prev_sync_state = state.sync_state;
         let updatable_state = UpdatableWatcherState {
             sync_state: &mut state.sync_state,
@@ -286,15 +286,15 @@ impl WatcherFsm {
             self.apply_to_state_container(prev_sync_state, |target| {
                 // Check if the watcher is at the front of the vecdeq, and if so, we can just pop it.
                 // Generally, this should be the case, as we'll be processing watchers in order.
-                if target.front() == Some(&watch_id) {
+                if target.front() == Some(&id) {
                     target.pop_front();
                     return;
                 }
 
                 // Otherwise, we'll need to find the item in the vecdeq, and remove it.
-                target.retain(|i| i != &watch_id);
+                target.retain(|i| i != &id);
             });
-            self.apply_to_state_container(next_sync_state, |target| target.push_back(watch_id));
+            self.apply_to_state_container(next_sync_state, |target| target.push_back(id));
         }
 
         Some(result)
@@ -327,9 +327,9 @@ impl WatcherFsm {
         &mut self,
         response: pb::WatchResponse,
     ) -> Option<pb::WatchResponse> {
-        let watch_id = WatchId(response.watch_id as _);
+        let id = WatchId(response.watch_id as _);
 
-        match (self.fragmented_responses.entry(watch_id), response.fragment) {
+        match (self.fragmented_responses.entry(id), response.fragment) {
             // We have an existing fragment, and this is a fragment, so we'll merge them.
             (Entry::Occupied(mut ent), true) => {
                 ent.get_mut().events.extend(response.events);
@@ -359,15 +359,12 @@ impl WatcherFsm {
         &mut self,
         response: pb::WatchResponse,
     ) -> Option<(WatchId, WatchResponse)> {
-        let watch_id = WatchId(response.watch_id as _);
+        let id = WatchId(response.watch_id as _);
 
         // There is a chance that we may receive a watch response for a watcher we already don't care about.
         // In this case, we'll just ignore the response, since we've already cancelled the watcher.
-        if !self.states.contains_key(&watch_id) {
-            tracing::info!(
-                "received response for unknown watcher: {:?} - ignoring",
-                response.watch_id
-            );
+        if !self.states.contains_key(&id) {
+            tracing::info!("received response for unknown watcher: {:?} - ignoring", id);
             return None;
         }
 
@@ -377,21 +374,21 @@ impl WatcherFsm {
         };
 
         if response.canceled {
-            self.cancel_watcher_with_source(watch_id, CancelSource::Server);
+            self.cancel_watcher_with_source(id, CancelSource::Server);
 
             Some((
-                watch_id,
+                id,
                 WatchResponse::CancelledByServer(CancelledByServer {
                     reason: response.cancel_reason.into(),
                 }),
             ))
         } else {
-            let response = self.update_watcher(watch_id, |mut s| {
+            let response = self.update_watcher(id, |mut s| {
                 if response.compact_revision != 0 {
                     tracing::warn!(
                         "when trying to sync watcher {:?} at revision {:?}, etcd server returned a compact revision of
                         {}, restarting watcher at compact revision.",
-                        watch_id, s.start_revision, response.compact_revision
+                        id, s.start_revision, response.compact_revision
                     );
                     *s.sync_state = WatcherSyncState::Unsynced;
                     // fixme: log compact revision properly, we need to re-fetch the entire key potentially?
@@ -406,7 +403,7 @@ impl WatcherFsm {
 
                 // the server has acknowledged the watcher, so we can mark it as synced.
                 if response.created {
-                    tracing::info!("watcher {:?} synced", watch_id);
+                    tracing::info!("watcher {:?} synced", id);
                     *s.sync_state = WatcherSyncState::Synced;
                 } else {
                     *s.start_revision = Some(revision + 1);
@@ -424,7 +421,7 @@ impl WatcherFsm {
                 WatchResponse::Events { events, revision }
             })?;
 
-            Some((watch_id, response))
+            Some((id, response))
         }
     }
 }
