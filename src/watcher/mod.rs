@@ -7,7 +7,7 @@ use std::{
     panic,
 };
 
-use fsm::{WatchCancelledByServer, WatchResponse, WatcherValue};
+use fsm::{CancelledByServer, WatchResponse, WatcherValue};
 use fsm_client::WatcherFsmClient;
 use thiserror::Error;
 use tokio::{
@@ -57,6 +57,9 @@ impl WatcherHandle {
     /// This method will coalesce watchers for the same key into a single watcher, meaning that concurrent watches
     /// to the same key will only create a single watcher on the etcd server, and values will be broadcast
     /// to all receivers.
+    ///
+    /// Note: The most recent copy of the key is stored in memory in order to coalesce the watcher. If this behavior
+    /// is not desired, use [`WatcherHandle::watch_with_config`] directly.
     pub async fn watch_key_coalesced(
         &self,
         key: impl Into<Key>,
@@ -104,6 +107,7 @@ enum WorkerMessage {
     ReceiverDropped(WatchId),
 }
 
+/// Returned by [`WatcherHandle::watch_key_coalesced`]
 #[derive(Debug)]
 pub struct CoalescedWatch {
     /// The initial value of the watched key. This value will be the latest value of the key at the time the watch
@@ -121,7 +125,7 @@ pub struct CoalescedWatch {
 #[derive(Debug)]
 enum WatchReceiverDropGuard {
     Armed {
-        tx: UnboundedSender<WorkerMessage>,
+        worker_sender: UnboundedSender<WorkerMessage>,
         id: WatchId,
     },
     Disarmed,
@@ -135,8 +139,8 @@ impl WatchReceiverDropGuard {
 
 impl Drop for WatchReceiverDropGuard {
     fn drop(&mut self) {
-        if let Self::Armed { tx, id: watch_id } = self {
-            tx.send(WorkerMessage::ReceiverDropped(*watch_id)).ok();
+        if let Self::Armed { worker_sender, id } = self {
+            worker_sender.send(WorkerMessage::ReceiverDropped(*id)).ok();
         }
     }
 }
@@ -148,11 +152,11 @@ enum ReceiverState<ReceiverT> {
         // be dropped after the receiver.
         drop_guard: WatchReceiverDropGuard,
     },
-    Cancelled(WatchCancelledByServer),
+    CancelledByServer(CancelledByServer),
 }
 
 pub struct CoalescedWatcherReceiver {
-    state: ReceiverState<broadcast::Receiver<Result<WatcherValue, WatchCancelledByServer>>>,
+    state: ReceiverState<broadcast::Receiver<Result<WatcherValue, CancelledByServer>>>,
 }
 
 impl std::fmt::Debug for CoalescedWatcherReceiver {
@@ -164,19 +168,19 @@ impl std::fmt::Debug for CoalescedWatcherReceiver {
 
 impl CoalescedWatcherReceiver {
     fn new(
-        receiver: broadcast::Receiver<Result<WatcherValue, WatchCancelledByServer>>,
-        tx: UnboundedSender<WorkerMessage>,
+        receiver: broadcast::Receiver<Result<WatcherValue, CancelledByServer>>,
+        worker_sender: UnboundedSender<WorkerMessage>,
         id: WatchId,
     ) -> Self {
         Self {
             state: ReceiverState::Active {
                 receiver,
-                drop_guard: WatchReceiverDropGuard::Armed { tx, id },
+                drop_guard: WatchReceiverDropGuard::Armed { worker_sender, id },
             },
         }
     }
 
-    pub async fn recv(&mut self) -> Result<WatcherValue, WatchCancelledByServer> {
+    pub async fn recv(&mut self) -> Result<WatcherValue, CancelledByServer> {
         loop {
             match &mut self.state {
                 ReceiverState::Active {
@@ -187,23 +191,24 @@ impl CoalescedWatcherReceiver {
                         Ok(Ok(value)) => return Ok(value),
                         Ok(Err(cancelled)) => {
                             drop_guard.disarm();
-                            self.state = ReceiverState::Cancelled(cancelled);
+                            self.state = ReceiverState::CancelledByServer(cancelled);
                         }
                         // If we have lagged, we'll skip over it and try to receive the next value.
                         Err(RecvError::Lagged(_)) => continue,
                         Err(RecvError::Closed) => {
-                            self.state = ReceiverState::Cancelled(WatchCancelledByServer {
+                            self.state = ReceiverState::CancelledByServer(CancelledByServer {
                                 reason: "watcher receiver closed".into(),
                             });
                         }
                     }
                 }
-                ReceiverState::Cancelled(err) => return Err(err.clone()),
+                ReceiverState::CancelledByServer(err) => return Err(err.clone()),
             }
         }
     }
 }
 
+/// Returned by [`WatcherHandle::watch_with_config`]
 pub struct ForwardedWatchReceiver {
     state: ReceiverState<UnboundedReceiver<WatchResponse>>,
 }
@@ -211,38 +216,44 @@ pub struct ForwardedWatchReceiver {
 impl ForwardedWatchReceiver {
     fn new(
         receiver: UnboundedReceiver<WatchResponse>,
-        tx: UnboundedSender<WorkerMessage>,
+        worker_sender: UnboundedSender<WorkerMessage>,
         id: WatchId,
     ) -> Self {
         Self {
             state: ReceiverState::Active {
                 receiver,
-                drop_guard: WatchReceiverDropGuard::Armed { tx, id },
+                drop_guard: WatchReceiverDropGuard::Armed { worker_sender, id },
             },
         }
     }
 
+    /// Receives a [`WatchResponse`] from the server.
+    ///
+    /// Once [`WatchResponse::Cancelled`] is returned, the watcher will return no more events, and the watcher
+    /// must be re-established.
     pub async fn recv(&mut self) -> WatchResponse {
         match &mut self.state {
             ReceiverState::Active {
                 receiver,
                 drop_guard,
             } => match receiver.recv().await {
-                Some(WatchResponse::Cancelled(reason)) => {
+                Some(WatchResponse::CancelledByServer(reason)) => {
                     drop_guard.disarm();
-                    self.state = ReceiverState::Cancelled(reason.clone());
-                    WatchResponse::Cancelled(reason)
+                    self.state = ReceiverState::CancelledByServer(reason.clone());
+                    WatchResponse::CancelledByServer(reason)
                 }
                 Some(response) => response,
                 None => {
-                    let reason = WatchCancelledByServer {
+                    let reason = CancelledByServer {
                         reason: "watcher receiver closed".into(),
                     };
-                    self.state = ReceiverState::Cancelled(reason.clone());
-                    WatchResponse::Cancelled(reason)
+                    self.state = ReceiverState::CancelledByServer(reason.clone());
+                    WatchResponse::CancelledByServer(reason)
                 }
             },
-            ReceiverState::Cancelled(reason) => WatchResponse::Cancelled(reason.clone()),
+            ReceiverState::CancelledByServer(reason) => {
+                WatchResponse::CancelledByServer(reason.clone())
+            }
         }
     }
 }
@@ -316,11 +327,15 @@ impl KeyWatchState {
         let is_cancelled = response.is_cancelled();
 
         match &mut self.watch_kind {
-            WatchKind::CoalescedKey { value, sender, .. } => {
+            WatchKind::CoalescedKey {
+                value,
+                broadcast_sender,
+                ..
+            } => {
                 if let WatchResponse::Events { events, .. } = response {
                     for event in events {
                         *value = event.value;
-                        sender.send(Ok(value.clone())).ok();
+                        broadcast_sender.send(Ok(value.clone())).ok();
                     }
                 }
             }
@@ -334,7 +349,9 @@ impl KeyWatchState {
 
     fn has_no_receiver(&self) -> bool {
         match &self.watch_kind {
-            WatchKind::CoalescedKey { sender, .. } => sender.receiver_count() == 0,
+            WatchKind::CoalescedKey {
+                broadcast_sender, ..
+            } => broadcast_sender.receiver_count() == 0,
             WatchKind::ForwardWatchResponses { sender } => sender.is_closed(),
         }
     }
@@ -344,7 +361,7 @@ enum WatchKind {
     CoalescedKey {
         key: Key,
         value: WatcherValue,
-        sender: broadcast::Sender<Result<WatcherValue, WatchCancelledByServer>>,
+        broadcast_sender: broadcast::Sender<Result<WatcherValue, CancelledByServer>>,
     },
     ForwardWatchResponses {
         sender: mpsc::UnboundedSender<WatchResponse>,
@@ -387,7 +404,11 @@ impl WatchedSet {
         watch_kind: WatchKind,
     ) -> Result<&KeyWatchState, InsertError> {
         match watch_kind {
-            WatchKind::CoalescedKey { key, value, sender } => {
+            WatchKind::CoalescedKey {
+                key,
+                value,
+                broadcast_sender,
+            } => {
                 let vacant_key = match self.coalesced_keys.entry(key) {
                     Entry::Occupied(ent) => {
                         return Err(InsertError::KeyAlreadyExists {
@@ -406,7 +427,11 @@ impl WatchedSet {
                 vacant_key.insert(id);
                 Ok(vacant_watch_id.insert(KeyWatchState {
                     id,
-                    watch_kind: WatchKind::CoalescedKey { key, value, sender },
+                    watch_kind: WatchKind::CoalescedKey {
+                        key,
+                        value,
+                        broadcast_sender,
+                    },
                 }))
             }
             WatchKind::ForwardWatchResponses { sender } => {
@@ -552,7 +577,7 @@ impl WatcherWorker {
             return;
         };
 
-        let Some(tx) = self.weak_sender.upgrade() else {
+        let Some(worker_sender) = self.weak_sender.upgrade() else {
             return;
         };
 
@@ -575,7 +600,8 @@ impl WatcherWorker {
                     let id = self.watcher_fsm_client.add_watcher(
                         WatchConfig::for_single_key(key.clone()).with_start_revision(revision + 1),
                     );
-                    let (sender, receiver) = broadcast::channel(Self::BROADCAST_CHANNEL_CAPACITY);
+                    let (broadcast_sender, receiver) =
+                        broadcast::channel(Self::BROADCAST_CHANNEL_CAPACITY);
 
                     let state = self
                         .watched
@@ -584,7 +610,7 @@ impl WatcherWorker {
                             WatchKind::CoalescedKey {
                                 key,
                                 value: value.clone(),
-                                sender,
+                                broadcast_sender,
                             },
                         )
                         .expect("invariant: insert should not fail");
@@ -599,7 +625,7 @@ impl WatcherWorker {
                                 value: value.clone(),
                                 receiver: CoalescedWatcherReceiver::new(
                                     receiver.resubscribe(),
-                                    tx.clone(),
+                                    worker_sender.clone(),
                                     state.id,
                                 ),
                             }))
@@ -628,34 +654,36 @@ impl WatcherWorker {
         self.watched.update_from_watch_response(id, response);
     }
 
-    fn do_coalesced_watch(&mut self, key: Key, sender: InitialCoalescedWatchSender) {
+    fn do_coalesced_watch(&mut self, key: Key, initial_sender: InitialCoalescedWatchSender) {
         // If the sender is closed, we'll just return, since we can't send the result.
-        if sender.is_closed() {
+        if initial_sender.is_closed() {
             return;
         }
 
         // We should be able to upgrade if there is a handle to the worker which sent us this request. If not,
         // there's no worker handle, so we'll just return.
-        let Some(tx) = self.weak_sender.upgrade() else {
+        let Some(sender) = self.weak_sender.upgrade() else {
             return;
         };
 
         // Check to see if we're already watching that key, so we can duplicate the watcher:
         if let Some(state) = self.watched.get_watch_state_by_key(&key) {
             let (value, receiver) = match &state.watch_kind {
-                WatchKind::CoalescedKey { value, sender, .. } => {
-                    (value.clone(), sender.subscribe())
-                }
+                WatchKind::CoalescedKey {
+                    value,
+                    broadcast_sender,
+                    ..
+                } => (value.clone(), broadcast_sender.subscribe()),
                 WatchKind::ForwardWatchResponses { .. } => {
                     unreachable!("unreachable: we should only have coalesced key watchers")
                 }
             };
 
             // We indeed have the key? Let's just send the initial state to the resolver.
-            sender
+            initial_sender
                 .send(Ok(CoalescedWatch {
                     value,
-                    receiver: CoalescedWatcherReceiver::new(receiver, tx, state.id),
+                    receiver: CoalescedWatcherReceiver::new(receiver, sender, state.id),
                 }))
                 .ok();
 
@@ -664,10 +692,10 @@ impl WatcherWorker {
 
         // Otherwise, we'll need to try and fetch the key from etcd, and then add a watcher.
         match self.in_progress_reads.entry(key) {
-            Entry::Occupied(mut ent) => ent.get_mut().push(sender),
+            Entry::Occupied(mut ent) => ent.get_mut().push(initial_sender),
             Entry::Vacant(ent) => {
                 let key = ent.key().clone();
-                ent.insert(vec![sender]);
+                ent.insert(vec![initial_sender]);
 
                 let mut kv_client = self.kv_client.clone();
                 self.range_request_join_set.spawn(async move {
@@ -686,7 +714,7 @@ impl WatcherWorker {
     ) {
         // We should be able to upgrade if there is a handle to the worker which sent us this request. If not,
         // there's no worker handle, so we'll just return.
-        let Some(tx) = self.weak_sender.upgrade() else {
+        let Some(worker_sender) = self.weak_sender.upgrade() else {
             return;
         };
 
@@ -697,7 +725,7 @@ impl WatcherWorker {
             .expect("invariant: insert should always succeed");
 
         initial_sender
-            .send(ForwardedWatchReceiver::new(receiver, tx, id))
+            .send(ForwardedWatchReceiver::new(receiver, worker_sender, id))
             .ok();
     }
 }

@@ -381,7 +381,7 @@ impl WatcherFsm {
 
             Some((
                 watch_id,
-                WatchResponse::Cancelled(WatchCancelledByServer {
+                WatchResponse::CancelledByServer(CancelledByServer {
                     reason: response.cancel_reason.into(),
                 }),
             ))
@@ -439,7 +439,7 @@ enum CancelSource {
 #[derive(Debug)]
 pub enum WatchResponse {
     /// The watcher was cancelled by the server.
-    Cancelled(WatchCancelledByServer),
+    CancelledByServer(CancelledByServer),
     /// The watcher emitted the following events.
     Events {
         events: Vec<WatcherEvent>,
@@ -457,13 +457,13 @@ impl WatchResponse {
     /// [`Cancelled`]: ProcessedWatchResponse::Cancelled
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Cancelled(..))
+        matches!(self, Self::CancelledByServer(..))
     }
 }
 
 #[derive(Debug, Error, Clone)]
 #[error("watch cancelled by server: {reason}")]
-pub struct WatchCancelledByServer {
+pub struct CancelledByServer {
     pub reason: Arc<str>,
 }
 
