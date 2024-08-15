@@ -56,12 +56,12 @@ fn spawn_watcher_task(
 fn spawn_watch_all(client: &Client) -> JoinHandle<Result<(), WatchError>> {
     let watcher = client.watcher();
     tokio::task::spawn(async move {
-        let mut r = watcher
+        let mut receiver = watcher
             .watch_with_config(WatchConfig::for_all_keys())
             .await?;
 
         loop {
-            match r.recv().await {
+            match receiver.recv().await {
                 Ok(events) => {
                     println!("all: events: {events:?}");
                 }

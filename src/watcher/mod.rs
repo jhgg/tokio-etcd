@@ -56,6 +56,10 @@ impl WatcherHandle {
 
     /// Watches a key in etcd, returning the latest value of the key, and a receiver that can be used to receive
     /// updates to the key.
+    ///
+    /// This method will coalesce watchers for the same key into a single watcher, meaning that concurrent watches
+    /// to the same key will only create a single watcher on the etcd server, and values will be broadcast
+    /// to all receivers.
     pub async fn watch_key_coalesced(
         &self,
         key: impl Into<Key>,
@@ -72,6 +76,9 @@ impl WatcherHandle {
         rx.await.expect("invariant: worker always sends a response")
     }
 
+    /// Watches a key in etcd, using the given [`WatchConfig`].
+    ///
+    /// The watcher will be automatically cancelled when the returned [`ForwardedWatchReceiver`] is dropped.
     pub async fn watch_with_config(
         &self,
         watch_config: WatchConfig,
@@ -219,6 +226,7 @@ impl ForwardedWatchReceiver {
         }
     }
 
+    // fixme: this should just return a ProcessedWatchResponse.
     pub async fn recv(&mut self) -> Result<Vec<WatcherEvent>, WatchCancelledByServer> {
         match &mut self.state {
             ReceiverState::Active {

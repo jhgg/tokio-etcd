@@ -41,6 +41,8 @@ pub struct WatcherEvent {
     pub key: Arc<[u8]>,
     /// The value that the key has been updated to.
     pub value: WatcherValue,
+    /// The previous value. Only set if the watcher was configured to receive previous values.
+    pub prev_value: WatcherValue,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +85,8 @@ impl UpdatableWatcherState<'_> {
     fn handle_event(&mut self, event: Event) -> WatcherEvent {
         let event_type = event.r#type();
         let kv = event.kv.expect("invariant: kv is always present");
+        let prev_kv = event.prev_kv;
+
         *self.start_revision =
             Some(kv.mod_revision.max(self.start_revision.unwrap_or_default()) + 1);
 
@@ -99,6 +103,16 @@ impl UpdatableWatcherState<'_> {
                 EventType::Delete => WatcherValue::Unset {
                     mod_revision: Some(kv.mod_revision),
                 },
+            },
+            prev_value: match prev_kv {
+                Some(kv) => WatcherValue::Set {
+                    value: kv.value.into(),
+                    mod_revision: kv.mod_revision as _,
+                    create_revision: kv.create_revision as _,
+                    version: kv.version as _,
+                    lease_id: LeaseId::new(kv.lease),
+                },
+                None => WatcherValue::Unset { mod_revision: None },
             },
         }
     }
