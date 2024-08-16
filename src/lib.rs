@@ -5,6 +5,7 @@ use std::{
 use tonic::Status;
 
 mod ids;
+pub mod kv;
 pub mod lease;
 mod utils;
 pub mod watcher;

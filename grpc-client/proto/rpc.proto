@@ -4,18 +4,6 @@ package etcdserverpb;
 import "kv.proto";
 import "auth.proto";
 
-service Woo {
-    rpc Get(GetRequest) returns (GetResponse) {}
-}
-
-message GetRequest {
-    string key = 1;
-}
-message GetResponse {
-    string value = 1;
-}
-
-
 service KV {
   // Range gets the keys in the range from the key-value store.
   rpc Range(RangeRequest) returns (RangeResponse) {}

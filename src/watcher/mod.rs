@@ -267,6 +267,8 @@ pub enum WatchError {
 type InitialCoalescedWatchSender = tokio::sync::oneshot::Sender<Result<CoalescedWatch, WatchError>>;
 type InitialForwardedWatchSender = tokio::sync::oneshot::Sender<ForwardedWatchReceiver>;
 
+
+// fixme: move this out of watcher.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Key(Box<[u8]>);
 
