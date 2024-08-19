@@ -21,7 +21,11 @@ use tokio_etcd_grpc_client::{self as pb};
 use tonic::{Response, Status};
 use util::range_end_for_prefix;
 
-use crate::{ids::IdFastHasherBuilder, WatchId};
+use crate::{
+    ids::{IdFastHasherBuilder, Revision},
+    kv::ResponseHeader,
+    WatchId,
+};
 
 /// A high-level etcd watcher, which handles the complexity of watching keys in etcd.
 ///
@@ -590,10 +594,11 @@ impl WatcherWorker {
             Ok(response) => {
                 let response = response.into_inner();
                 let kv = response.kvs.into_iter().next();
-                let revision = response
-                    .header
-                    .expect("invariant: header is always present")
-                    .revision;
+                let header = ResponseHeader::from(
+                    response
+                        .header
+                        .expect("invariant: header is always present"),
+                );
 
                 let value = match kv {
                     Some(kv) => WatcherValue::from_kv(kv),
@@ -603,7 +608,8 @@ impl WatcherWorker {
                 // Now, begin watching:
                 let id = {
                     let id = self.watcher_fsm_client.add_watcher(
-                        WatchConfig::for_single_key(key.clone()).with_start_revision(revision + 1),
+                        WatchConfig::for_single_key(key.clone())
+                            .with_start_revision(header.revision.next()),
                     );
                     let (broadcast_sender, receiver) =
                         broadcast::channel(Self::BROADCAST_CHANNEL_CAPACITY);
@@ -741,7 +747,7 @@ pub struct WatchConfig {
     range_end: Option<Key>,
     events: WatchEvents,
     prev_kv: bool,
-    start_revision: Option<i64>,
+    start_revision: Option<Revision>,
 }
 
 impl WatchConfig {
@@ -788,7 +794,7 @@ impl WatchConfig {
     /// Starts the watcher with the given revision.
     ///
     /// Default: starts at the latest revision at the time the watcher is received by etcd.
-    pub fn with_start_revision(mut self, revision: i64) -> Self {
+    pub fn with_start_revision(mut self, revision: Revision) -> Self {
         self.start_revision = Some(revision);
         self
     }

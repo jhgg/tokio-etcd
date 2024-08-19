@@ -5,7 +5,12 @@ use tokio_etcd_grpc_client::{self as pb, Member};
 use tonic::Status;
 use ts::OptionOrIgnored;
 
-use crate::{lease::LeaseHandle, watcher::Key, LeaseId};
+use crate::{
+    ids::{ClusterId, MemberId, RaftTerm, Revision, Version},
+    lease::LeaseHandle,
+    watcher::Key,
+    LeaseId,
+};
 
 pub struct KVClient {
     client: pb::KvClient<pb::AuthedChannel>,
@@ -354,20 +359,6 @@ struct PutResponseWithPrevKeyValue {
     /// Set to `None` if the key was not set prior to executing the put request.
     prev_kv: Option<KeyValue>,
 }
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-pub struct ClusterId(pub u64);
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-pub struct MemberId(pub u64);
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-pub struct RaftTerm(pub u64);
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-pub struct Revision(pub i64);
-
-pub struct Version(pub i64);
 
 pub struct ResponseHeader {
     pub cluster_id: ClusterId,

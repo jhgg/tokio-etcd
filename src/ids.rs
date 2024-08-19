@@ -83,3 +83,25 @@ impl std::hash::Hasher for IdFastHasher {
         panic!("fast hasher only supports i64");
     }
 }
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ClusterId(pub u64);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub struct MemberId(pub u64);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub struct RaftTerm(pub u64);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Default)]
+pub struct Revision(pub i64);
+
+impl Revision {
+    /// The next revision after this one.
+    pub fn next(self) -> Revision {
+        Revision(self.0 + 1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub struct Version(pub i64);

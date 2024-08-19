@@ -6,8 +6,12 @@ use std::{
 use thiserror::Error;
 use tokio_etcd_grpc_client::{self as pb};
 
-use super::WatchConfig;
-use crate::{ids::IdFastHasherBuilder, LeaseId, WatchId};
+use super::{Key, WatchConfig};
+use crate::{
+    ids::{IdFastHasherBuilder, Revision, Version},
+    kv::{KeyValue, ResponseHeader},
+    LeaseId, WatchId,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WatcherSyncState {
@@ -29,13 +33,13 @@ struct WatcherState {
 // A subset of the WatcherState, which contains mutable references to fields that are safe to update.
 struct UpdatableWatcherState<'a> {
     sync_state: &'a mut WatcherSyncState,
-    start_revision: &'a mut Option<i64>,
+    start_revision: &'a mut Option<Revision>,
 }
 
 #[derive(Debug)]
 pub struct WatcherEvent {
     /// The key (in bytes) that has been updated.
-    pub key: Arc<[u8]>,
+    pub key: Key,
     /// The value that the key has been updated to.
     pub value: WatcherValue,
     /// The previous value. Only set if the watcher was configured to receive previous values.
@@ -48,12 +52,12 @@ pub enum WatcherValue {
         /// The value that the key has been set to.
         value: Arc<[u8]>,
         /// The revision that the key was modified.
-        mod_revision: u64,
+        mod_revision: Revision,
         /// The revision that the key was created.
-        create_revision: u64,
+        create_revision: Revision,
         /// Version is the version of the key. A deletion resets the version to zero and any modification of the key
         /// increases its version.
-        version: u64,
+        version: Version,
         /// lease is the ID of the lease that attached to key. When the attached lease expires, the key will be deleted.
         /// If lease is None, then no lease is attached to the key.
         lease_id: Option<LeaseId>,
@@ -62,7 +66,7 @@ pub enum WatcherValue {
         /// The revision of the key that was deleted, if it is known.
         ///
         /// If the key was deleted before we started watching, we won't have the revision of the key that was deleted.
-        mod_revision: Option<i64>,
+        mod_revision: Option<Revision>,
     },
 }
 
@@ -70,9 +74,9 @@ impl WatcherValue {
     pub(crate) fn from_kv(kv: pb::KeyValue) -> Self {
         Self::Set {
             value: kv.value.into(),
-            mod_revision: kv.mod_revision as _,
-            create_revision: kv.create_revision as _,
-            version: kv.version as _,
+            mod_revision: Revision(kv.mod_revision),
+            create_revision: Revision(kv.create_revision),
+            version: Version(kv.version),
             lease_id: LeaseId::new(kv.lease),
         }
     }
@@ -81,21 +85,24 @@ impl WatcherValue {
 impl UpdatableWatcherState<'_> {
     fn handle_event(&mut self, event: pb::Event) -> WatcherEvent {
         let event_type = event.r#type();
-        let kv = event.kv.expect("invariant: kv is always present");
-        let prev_kv = event.prev_kv;
+        let kv = KeyValue::from(event.kv.expect("invariant: kv is always present"));
+        let prev_kv = event.prev_kv.map(KeyValue::from);
 
-        *self.start_revision =
-            Some(kv.mod_revision.max(self.start_revision.unwrap_or_default()) + 1);
+        *self.start_revision = Some(
+            kv.mod_revision
+                .max(self.start_revision.unwrap_or_default())
+                .next(),
+        );
 
         WatcherEvent {
-            key: kv.key.into(),
+            key: kv.key,
             value: match event_type {
                 pb::EventType::Put => WatcherValue::Set {
                     value: kv.value.into(),
-                    mod_revision: kv.mod_revision as _,
-                    create_revision: kv.create_revision as _,
-                    version: kv.version as _,
-                    lease_id: LeaseId::new(kv.lease),
+                    mod_revision: kv.mod_revision,
+                    create_revision: kv.create_revision,
+                    version: kv.version,
+                    lease_id: kv.lease,
                 },
                 pb::EventType::Delete => WatcherValue::Unset {
                     mod_revision: Some(kv.mod_revision),
@@ -104,10 +111,10 @@ impl UpdatableWatcherState<'_> {
             prev_value: match prev_kv {
                 Some(kv) => WatcherValue::Set {
                     value: kv.value.into(),
-                    mod_revision: kv.mod_revision as _,
-                    create_revision: kv.create_revision as _,
+                    mod_revision: kv.mod_revision,
+                    create_revision: kv.create_revision,
                     version: kv.version as _,
-                    lease_id: LeaseId::new(kv.lease),
+                    lease_id: kv.lease,
                 },
                 None => WatcherValue::Unset { mod_revision: None },
             },
@@ -134,7 +141,7 @@ impl WatcherState {
                     // configured values:
                     key: key.as_vec(),
                     range_end: range_end.as_ref().map(|x| x.as_vec()).unwrap_or_default(),
-                    start_revision: start_revision.unwrap_or_default(),
+                    start_revision: start_revision.unwrap_or_default().0,
                     filters: events.for_filters_proto(),
                     prev_kv: *prev_kv,
                 },
@@ -392,25 +399,24 @@ impl WatcherFsm {
                     );
                     *s.sync_state = WatcherSyncState::Unsynced;
                     // fixme: log compact revision properly, we need to re-fetch the entire key potentially?
-                    *s.start_revision = Some(response.compact_revision);
-                    return WatchResponse::CompactRevision { revision: response.compact_revision };
+                    *s.start_revision = Some(Revision(response.compact_revision));
+                    return WatchResponse::CompactRevision { revision: Revision(response.compact_revision) };
                 }
 
-                let revision = response
+                let header = ResponseHeader::from(response
                         .header
-                        .expect("invariant: header is always present")
-                        .revision;
+                        .expect("invariant: header is always present"));
 
                 // the server has acknowledged the watcher, so we can mark it as synced.
                 if response.created {
                     tracing::info!("watcher {:?} synced", id);
                     *s.sync_state = WatcherSyncState::Synced;
                 } else {
-                    *s.start_revision = Some(revision + 1);
+                    *s.start_revision = Some(header.revision.next());
                 }
 
                 if response.is_progress_notify() {
-                    return WatchResponse::Progress { revision };
+                    return WatchResponse::Progress { revision: header.revision };
                 }
 
                 let mut events = Vec::with_capacity(response.events.len());
@@ -418,7 +424,7 @@ impl WatcherFsm {
                     events.push(s.handle_event(event));
                 }
 
-                WatchResponse::Events { events, revision }
+                WatchResponse::Events { events, revision: header.revision }
             })?;
 
             Some((id, response))
@@ -440,12 +446,12 @@ pub enum WatchResponse {
     /// The watcher emitted the following events.
     Events {
         events: Vec<WatcherEvent>,
-        revision: i64,
+        revision: Revision,
     },
     /// The watcher notified progress which updated the revision.
-    Progress { revision: i64 },
+    Progress { revision: Revision },
     /// The watcher revision was compacted.
-    CompactRevision { revision: i64 },
+    CompactRevision { revision: Revision },
 }
 
 impl WatchResponse {
