@@ -267,7 +267,6 @@ pub enum WatchError {
 type InitialCoalescedWatchSender = tokio::sync::oneshot::Sender<Result<CoalescedWatch, WatchError>>;
 type InitialForwardedWatchSender = tokio::sync::oneshot::Sender<ForwardedWatchReceiver>;
 
-
 // fixme: move this out of watcher.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Key(Box<[u8]>);
@@ -313,6 +312,10 @@ impl Key {
 
     fn as_vec(&self) -> Vec<u8> {
         self.0.clone().into_vec()
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        self.0.into_vec()
     }
 
     fn as_slice(&self) -> &[u8] {
