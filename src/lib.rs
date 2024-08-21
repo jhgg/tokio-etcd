@@ -1,3 +1,4 @@
+use kv::KVClient;
 use std::{
     sync::{Arc, Mutex, Weak},
     time::Duration,
@@ -82,6 +83,10 @@ impl Client {
             ttl,
         )
         .await
+    }
+
+    pub fn kv(&self) -> KVClient {
+        KVClient::new(self.grpc_client.kv())
     }
 }
 

@@ -1,7 +1,5 @@
-use std::fmt::Display;
-
 use thiserror::Error;
-use tokio_etcd_grpc_client::{self as pb, Member};
+use tokio_etcd_grpc_client::{self as pb};
 use tonic::Status;
 use ts::OptionOrIgnored;
 
@@ -65,18 +63,18 @@ mod ts {
     }
 
     impl<T> From<Unset<T>> for Option<T> {
-        fn from(value: Unset<T>) -> Self {
+        fn from(_: Unset<T>) -> Self {
             None
         }
     }
 
     impl<T> From<Ignored<T>> for Option<T> {
-        fn from(value: Ignored<T>) -> Self {
+        fn from(_: Ignored<T>) -> Self {
             None
         }
     }
 
-    pub(super) enum OptionOrIgnored<T> {
+    pub enum OptionOrIgnored<T> {
         Some(T),
         None,
         Ignored,
@@ -89,13 +87,13 @@ mod ts {
     }
 
     impl<T> From<Unset<T>> for OptionOrIgnored<T> {
-        fn from(value: Unset<T>) -> Self {
+        fn from(_: Unset<T>) -> Self {
             OptionOrIgnored::None
         }
     }
 
     impl<T> From<Ignored<T>> for OptionOrIgnored<T> {
-        fn from(value: Ignored<T>) -> Self {
+        fn from(_: Ignored<T>) -> Self {
             OptionOrIgnored::Ignored
         }
     }
@@ -164,7 +162,7 @@ impl<TPrev> PutRequest<ts::Unset<Vec<u8>>, TPrev, ts::Unset<LeaseIdOrHandle>> {
 }
 
 #[derive(Debug, Error)]
-enum PutError {
+pub enum PutError {
     #[error("lease handle has been revoked.")]
     LeaseHandleRevoked,
 
@@ -354,12 +352,7 @@ impl From<pb::KeyValue> for KeyValue {
     }
 }
 
-/// Returned when executing a [`PutRequest`] where the prev_kv is requested.
-struct PutResponseWithPrevKeyValue {
-    /// Set to `None` if the key was not set prior to executing the put request.
-    prev_kv: Option<KeyValue>,
-}
-
+#[derive(Debug, Clone, Copy)]
 pub struct ResponseHeader {
     pub cluster_id: ClusterId,
     /// member_id is the ID of the member which sent the response.
@@ -385,9 +378,15 @@ impl From<pb::ResponseHeader> for ResponseHeader {
     }
 }
 
-struct PutResponse<TPrev = ()> {
-    header: ResponseHeader,
+pub struct PutResponse<TPrev = ()> {
+    pub header: ResponseHeader,
     prev: TPrev,
+}
+
+impl PutResponse<Option<KeyValue>> {
+    pub fn into_prev_kv(self) -> Option<KeyValue> {
+        self.prev
+    }
 }
 
 async fn qux(kv: KVClient) {
