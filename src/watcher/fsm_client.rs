@@ -9,7 +9,7 @@ use tokio_etcd_grpc_client::{self as pb};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Response, Status, Streaming};
 
-use crate::{utils::backoff::ExponentialBackoff, WatchId};
+use crate::{ids::WatchId, utils::backoff::ExponentialBackoff};
 
 use super::{
     fsm::{WatchResponse, WatcherFsm},

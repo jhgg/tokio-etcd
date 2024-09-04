@@ -8,9 +8,8 @@ use tokio_etcd_grpc_client::{self as pb};
 
 use super::{Key, WatchConfig};
 use crate::{
-    ids::{IdFastHasherBuilder, Revision, Version},
+    ids::{IdFastHasherBuilder, LeaseId, Revision, Version, WatchId},
     kv::{KeyValue, ResponseHeader},
-    LeaseId, WatchId,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

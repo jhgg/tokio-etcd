@@ -26,7 +26,10 @@ use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tokio_util::time::{delay_queue::Key, DelayQueue};
 use tonic::{Response, Status, Streaming};
 
-use crate::{ids::IdFastHasherBuilder, utils::backoff::ExponentialBackoff, LeaseId};
+use crate::{
+    ids::{IdFastHasherBuilder, LeaseId},
+    utils::backoff::ExponentialBackoff,
+};
 
 struct LeaseRevokedNotify {
     notify: Notify,

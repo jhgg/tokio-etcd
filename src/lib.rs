@@ -11,7 +11,6 @@ pub mod lease;
 mod utils;
 pub mod watcher;
 
-pub use ids::{LeaseId, WatchId};
 use lease::{LeaseHandle, LeaseWorkerHandle, LeaseWorkerMessage};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, WeakUnboundedSender};
 pub use tokio_etcd_grpc_client::ClientEndpointConfig;

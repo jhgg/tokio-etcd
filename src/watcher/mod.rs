@@ -22,9 +22,8 @@ use tonic::{Response, Status};
 use util::range_end_for_prefix;
 
 use crate::{
-    ids::{IdFastHasherBuilder, Revision},
+    ids::{IdFastHasherBuilder, Revision, WatchId},
     kv::ResponseHeader,
-    WatchId,
 };
 
 /// A high-level etcd watcher, which handles the complexity of watching keys in etcd.
