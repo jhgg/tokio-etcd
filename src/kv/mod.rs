@@ -1,12 +1,19 @@
+use std::time::Duration;
+
 use crate::{
     ids::{ClusterId, LeaseId, MemberId, RaftTerm, Revision, Version},
+    utils::backoff::ExponentialBackoff,
     watcher::Key,
 };
 
+use tokio::time::timeout;
 use tokio_etcd_grpc_client::{self as pb};
+use tonic::Status;
+use util::is_retryable_error_code;
 
 mod put;
 mod ts;
+mod util;
 
 pub struct KVClient {
     client: pb::KvClient<pb::AuthedChannel>,
@@ -19,6 +26,49 @@ impl KVClient {
 
     pub fn put(&self, key: impl Into<Key>) -> put::PutRequest {
         put::PutRequest::new(self.client.clone(), key.into())
+    }
+
+    /// Convenience method to get a single key. For more advanced options, use [`KVClient::range_request`].
+    pub async fn get(&self, key: impl Into<Key>) -> Result<Option<KeyValue>, Status> {
+        let request = pb::RangeRequest {
+            key: key.into().into_vec(),
+            ..Default::default()
+        };
+
+        let mut client = self.client.clone();
+        let mut backoff =
+            ExponentialBackoff::new(Duration::from_millis(50), Duration::from_secs(2));
+
+        match timeout(Duration::from_secs(10), async move {
+            loop {
+                match client.range(request.clone()).await {
+                    Ok(response) => {
+                        return Ok(response
+                            .into_inner()
+                            .kvs
+                            .into_iter()
+                            .next()
+                            .map(KeyValue::from));
+                    }
+                    Err(status) => {
+                        if is_retryable_error_code(status.code()) {
+                            backoff.delay().await;
+                        } else {
+                            return Err(status);
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => Err(Status::deadline_exceeded("request timed out")),
+        }
+    }
+
+    pub fn range_request(&self) {
+        todo!()
     }
 }
 
